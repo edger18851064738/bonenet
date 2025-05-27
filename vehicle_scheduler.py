@@ -89,11 +89,28 @@ class EnhancedVehicleState:
     current_load: float = 0
     speed: float = 1.0
     
+    # 新增：车辆安全参数
+    vehicle_length: float = 6.0
+    vehicle_width: float = 3.0
+    safety_margin: float = 1.5
+    turning_radius: float = 8.0
+    
     # 任务相关
     current_task: Optional[str] = None
-    task_queue: List[str] = None  # 任务队列
+    task_queue: List[str] = None
     completed_cycles: int = 0
-    priority_level: float = 0.5  # 车辆优先级
+    priority_level: float = 0.5
+    
+    # 新增：骨干路径稳定性
+    last_backbone_path_id: Optional[str] = None
+    backbone_switch_count: int = 0
+    last_backbone_switch_time: float = 0.0
+    backbone_path_stability: float = 1.0
+    
+    # 新增：冲突相关统计
+    conflict_count: int = 0
+    last_conflict_time: float = 0.0
+    conflict_resolution_success_rate: float = 1.0
     
     # 效率统计
     total_distance: float = 0
@@ -101,11 +118,6 @@ class EnhancedVehicleState:
     idle_time: float = 0
     productive_time: float = 0
     efficiency_history: List[float] = None
-    
-    # 性能指标
-    average_speed: float = 1.0
-    backbone_usage_ratio: float = 0.0
-    task_success_rate: float = 1.0
     
     def __post_init__(self):
         if self.task_queue is None:
@@ -138,6 +150,41 @@ class EnhancedVehicleState:
         # 限制历史长度
         if len(self.efficiency_history) > 20:
             self.efficiency_history = self.efficiency_history[-10:]
+    def get_safety_params(self) -> Dict:
+        """获取车辆安全参数"""
+        return {
+            'length': self.vehicle_length,
+            'width': self.vehicle_width,
+            'safety_margin': self.safety_margin,
+            'turning_radius': self.turning_radius
+        }
+    
+    def update_backbone_stability(self, new_backbone_id: Optional[str]):
+        """更新骨干路径稳定性"""
+        current_time = time.time()
+        
+        if new_backbone_id and new_backbone_id != self.last_backbone_path_id:
+            if self.last_backbone_path_id is not None:
+                # 发生了路径切换
+                self.backbone_switch_count += 1
+                self.last_backbone_switch_time = current_time
+                
+                # 降低稳定性分数
+                switch_penalty = 0.15 if self.backbone_switch_count <= 3 else 0.25
+                self.backbone_path_stability = max(0.1, 
+                    self.backbone_path_stability - switch_penalty)
+                
+                print(f"车辆 {self.vehicle_id} 切换骨干路径: {self.last_backbone_path_id} -> {new_backbone_id} "
+                      f"(第{self.backbone_switch_count}次)")
+            
+            self.last_backbone_path_id = new_backbone_id
+        elif new_backbone_id == self.last_backbone_path_id:
+            # 保持同一路径，提升稳定性
+            time_since_switch = current_time - self.last_backbone_switch_time
+            if time_since_switch > 120:  # 2分钟稳定后开始恢复
+                stability_bonus = min(0.05, (time_since_switch - 120) / 3600 * 0.1)
+                self.backbone_path_stability = min(1.0, 
+                    self.backbone_path_stability + stability_bonus)
 
 class SystemEfficiencyOptimizer:
     """系统效率优化器"""
@@ -852,28 +899,49 @@ class EnhancedVehicleScheduler:
     
     def _start_enhanced_movement(self, task: EnhancedTask, 
                                vehicle_state: EnhancedVehicleState) -> bool:
-        """开始增强移动"""
+        """增强的移动开始 - 传递安全参数"""
         if not task.path:
             return False
         
         # 更新状态
         vehicle_state.status = VehicleStatus.MOVING
         
-        # 同步到环境
+        # 提取骨干路径ID
+        backbone_id = None
+        if task.path_structure:
+            backbone_id = task.path_structure.get('path_id')
+        
+        # 更新骨干路径稳定性
+        vehicle_state.update_backbone_stability(backbone_id)
+        
+        # 注册到交通管理器时传递完整信息
+        if self.traffic_manager:
+            registration_success = self.traffic_manager.register_vehicle_path(
+                vehicle_state.vehicle_id, 
+                task.path, 
+                task.start_time,
+                speed=vehicle_state.speed,
+                vehicle_params=vehicle_state.get_safety_params()
+            )
+            
+            if not registration_success:
+                print(f"车辆 {vehicle_state.vehicle_id} 路径注册失败")
+                return False
+        
+        # 同步到环境时包含安全参数
         if vehicle_state.vehicle_id in self.env.vehicles:
             env_vehicle = self.env.vehicles[vehicle_state.vehicle_id]
             env_vehicle['status'] = 'moving'
             env_vehicle['path'] = task.path
-            env_vehicle['path_index'] = 0
-            env_vehicle['progress'] = 0.0
             env_vehicle['path_structure'] = task.path_structure or {}
-        
-        # 记录统计
-        if task.backbone_utilization > 0:
-            self.stats['backbone_usage_count'] += 1
+            
+            # 新增：安全参数
+            env_vehicle['safety_params'] = vehicle_state.get_safety_params()
+            env_vehicle['backbone_stability'] = vehicle_state.backbone_path_stability
+            env_vehicle['conflict_count'] = vehicle_state.conflict_count
         
         print(f"车辆 {vehicle_state.vehicle_id} 开始增强任务 {task.task_id} "
-              f"({task.task_type}, 优先级: {task.priority.name})")
+              f"(稳定性: {vehicle_state.backbone_path_stability:.2f})")
         return True
     
     def update(self, time_delta: float):
@@ -996,7 +1064,71 @@ class EnhancedVehicleScheduler:
                 # 检查到达
                 if new_progress >= 0.95:
                     self._handle_enhanced_arrival(task, vehicle_state)
-    
+    def handle_conflict_resolution_result(self, vehicle_id: str, resolution_success: bool):
+        """处理冲突解决结果"""
+        if vehicle_id in self.vehicle_states:
+            vehicle_state = self.vehicle_states[vehicle_id]
+            
+            if resolution_success:
+                # 冲突解决成功
+                success_count = getattr(vehicle_state, '_conflict_success_count', 0) + 1
+                total_conflicts = vehicle_state.conflict_count + 1
+                
+                vehicle_state.conflict_resolution_success_rate = success_count / total_conflicts
+                vehicle_state._conflict_success_count = success_count
+                
+                print(f"车辆 {vehicle_id} 冲突解决成功，成功率: {vehicle_state.conflict_resolution_success_rate:.2%}")
+            else:
+                # 冲突解决失败
+                vehicle_state.conflict_count += 1
+                vehicle_state.last_conflict_time = time.time()
+                
+                # 重新计算成功率
+                success_count = getattr(vehicle_state, '_conflict_success_count', 0)
+                if vehicle_state.conflict_count > 0:
+                    vehicle_state.conflict_resolution_success_rate = success_count / vehicle_state.conflict_count
+                
+                print(f"车辆 {vehicle_id} 冲突解决失败，总冲突数: {vehicle_state.conflict_count}")    
+    def get_vehicle_safety_report(self, vehicle_id: str) -> Dict:
+        """获取车辆安全报告"""
+        if vehicle_id not in self.vehicle_states:
+            return {}
+        
+        vehicle_state = self.vehicle_states[vehicle_id]
+        
+        return {
+            'vehicle_id': vehicle_id,
+            'safety_params': vehicle_state.get_safety_params(),
+            'backbone_stability': {
+                'score': vehicle_state.backbone_path_stability,
+                'switch_count': vehicle_state.backbone_switch_count,
+                'last_switch_time': vehicle_state.last_backbone_switch_time,
+                'current_backbone_id': vehicle_state.last_backbone_path_id
+            },
+            'conflict_stats': {
+                'total_conflicts': vehicle_state.conflict_count,
+                'last_conflict_time': vehicle_state.last_conflict_time,
+                'resolution_success_rate': vehicle_state.conflict_resolution_success_rate
+            },
+            'stability_recommendations': self._generate_stability_recommendations(vehicle_state)
+        }
+    def _generate_stability_recommendations(self, vehicle_state: EnhancedVehicleState) -> List[str]:
+        """生成稳定性改进建议"""
+        recommendations = []
+        
+        if vehicle_state.backbone_switch_count > 3:
+            recommendations.append("建议降低该车辆优先级，减少路径切换")
+        
+        if vehicle_state.backbone_path_stability < 0.5:
+            recommendations.append("考虑为该车辆指定固定骨干路径")
+        
+        if vehicle_state.conflict_count > 5:
+            recommendations.append("建议检查该车辆的路径规划质量")
+        
+        if vehicle_state.conflict_resolution_success_rate < 0.7:
+            recommendations.append("该车辆冲突解决效果较差，建议调整策略权重")
+        
+        return recommendations
     def _handle_enhanced_arrival(self, task: EnhancedTask, 
                                vehicle_state: EnhancedVehicleState):
         """处理增强到达事件"""
