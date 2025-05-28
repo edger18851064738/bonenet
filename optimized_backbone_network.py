@@ -202,11 +202,48 @@ class SafeInterfaceManager:
         self.vehicle_safety_params = {}  # {vehicle_id: safety_params}
         self.interface_safety_cache = {}  # {interface_id: safety_info}
         self.min_safety_distance = 8.0
-    
+
+    def fix_safety_params(safety_params):
+        """修复安全参数类型问题"""
+        if hasattr(safety_params, 'to_dict'):
+            # 如果是VehicleSafetyParams对象，转换为字典
+            return safety_params.to_dict()
+        elif isinstance(safety_params, dict):
+            # 如果已经是字典，直接返回
+            return safety_params
+        else:
+            # 其他情况返回默认字典
+            return {
+                'length': 6.0,
+                'width': 3.0,
+                'safety_margin': 1.5,
+                'turning_radius': 8.0
+            }
+
+
+   
     def register_vehicle_safety_params(self, vehicle_id: str, safety_params: Dict):
         """注册车辆安全参数"""
         # 验证参数完整性
         required_params = ['length', 'width', 'safety_margin']
+            # 在使用前调用修复函数
+        def fix_safety_params(safety_params):
+            """修复安全参数类型问题"""
+            if hasattr(safety_params, 'to_dict'):
+                # 如果是VehicleSafetyParams对象，转换为字典
+                return safety_params.to_dict()
+            elif isinstance(safety_params, dict):
+                # 如果已经是字典，直接返回
+                return safety_params
+            else:
+                # 其他情况返回默认字典
+                return {
+                    'length': 6.0,
+                    'width': 3.0,
+                    'safety_margin': 1.5,
+                    'turning_radius': 8.0
+                }
+        safety_params = fix_safety_params(safety_params)
         for param in required_params:
             if param not in safety_params:
                 safety_params[param] = {'length': 6.0, 'width': 3.0, 'safety_margin': 1.5}[param]

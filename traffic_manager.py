@@ -1,7 +1,6 @@
 """
-traffic_manager_with_ecbs.py - 完整ECBS集成的交通管理器
-实现完整的Enhanced Conflict-Based Search算法
-支持多车辆协调、骨干路径约束、安全矩形冲突检测
+traffic_manager.py - 完整ECBS集成的交通管理器 (修复版)
+添加了缺失的方法和完善的接口
 """
 
 import math
@@ -667,7 +666,7 @@ class ECBSSolver:
         return structures
 
 class OptimizedTrafficManagerWithECBS:
-    """集成完整ECBS的优化交通管理器"""
+    """集成完整ECBS的优化交通管理器 - 修复版"""
     
     def __init__(self, env, backbone_network=None, path_planner=None):
         # 核心组件
@@ -683,6 +682,9 @@ class OptimizedTrafficManagerWithECBS:
         self.prediction_horizon = 30
         self.active_paths = {}
         self.path_reservations = {}
+        
+        # 新增：车辆优先级管理
+        self.vehicle_priorities = {}  # {vehicle_id: priority_value}
         
         # 车辆参数
         self.vehicle_params = {
@@ -706,10 +708,76 @@ class OptimizedTrafficManagerWithECBS:
             'ecbs_success_rate': 0.0,
             'average_solve_time': 0.0,
             'constraint_violations': 0,
-            'backbone_conflicts': 0
+            'backbone_conflicts': 0,
+            'priority_adjustments': 0
         }
         
-        print("初始化集成完整ECBS的优化交通管理器")
+        print("初始化集成完整ECBS的优化交通管理器 (修复版)")
+    
+    # ==================== 新增：缺失的方法 ====================
+    
+    def set_vehicle_priority(self, vehicle_id: str, priority: float) -> bool:
+        """设置车辆优先级"""
+        try:
+            priority = max(0.0, min(1.0, priority))  # 限制在[0,1]范围内
+            
+            with self.state_lock:
+                old_priority = self.vehicle_priorities.get(vehicle_id, 0.5)
+                self.vehicle_priorities[vehicle_id] = priority
+                
+                if abs(old_priority - priority) > 0.1:
+                    self.stats['priority_adjustments'] += 1
+                    print(f"车辆 {vehicle_id} 优先级调整: {old_priority:.2f} -> {priority:.2f}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"设置车辆优先级失败 {vehicle_id}: {e}")
+            return False
+    
+    def get_vehicle_priority(self, vehicle_id: str) -> float:
+        """获取车辆优先级"""
+        return self.vehicle_priorities.get(vehicle_id, 0.5)
+    
+    def update_vehicle_priority(self, vehicle_id: str, priority_delta: float) -> bool:
+        """增量更新车辆优先级"""
+        current_priority = self.get_vehicle_priority(vehicle_id)
+        new_priority = current_priority + priority_delta
+        return self.set_vehicle_priority(vehicle_id, new_priority)
+    
+    def get_all_vehicle_priorities(self) -> Dict[str, float]:
+        """获取所有车辆优先级"""
+        with self.state_lock:
+            return self.vehicle_priorities.copy()
+    
+    def reset_vehicle_priorities(self):
+        """重置所有车辆优先级"""
+        with self.state_lock:
+            self.vehicle_priorities.clear()
+            print("已重置所有车辆优先级")
+    
+    def get_high_priority_vehicles(self, threshold: float = 0.7) -> List[str]:
+        """获取高优先级车辆列表"""
+        with self.state_lock:
+            return [vid for vid, priority in self.vehicle_priorities.items() 
+                   if priority >= threshold]
+    
+    def prioritize_vehicle_paths(self, vehicle_ids: List[str]) -> bool:
+        """为指定车辆提高路径优先级"""
+        try:
+            success_count = 0
+            for vehicle_id in vehicle_ids:
+                if self.update_vehicle_priority(vehicle_id, 0.2):
+                    success_count += 1
+            
+            print(f"提升了 {success_count}/{len(vehicle_ids)} 个车辆的路径优先级")
+            return success_count > 0
+            
+        except Exception as e:
+            print(f"优先级提升失败: {e}")
+            return False
+    
+    # ==================== ECBS协调功能 ====================
     
     def ecbs_coordinate_paths(self, vehicle_requests: Dict[str, Dict],
                             backbone_allocations: Dict[str, str] = None,
@@ -730,6 +798,9 @@ class OptimizedTrafficManagerWithECBS:
         
         try:
             print(f"开始ECBS多车辆协调: {len(vehicle_requests)} 个车辆")
+            
+            # 考虑车辆优先级调整请求
+            self._adjust_requests_by_priority(vehicle_requests)
             
             # 设置求解器参数
             self.ecbs_solver.timeout = max_solve_time
@@ -761,6 +832,18 @@ class OptimizedTrafficManagerWithECBS:
             self._update_ecbs_statistics(False, max_solve_time)
             print(f"ECBS协调异常: {e}")
             return {'success': False, 'error': f'协调异常: {str(e)}'}
+    
+    def _adjust_requests_by_priority(self, vehicle_requests: Dict[str, Dict]):
+        """根据车辆优先级调整请求"""
+        for vehicle_id, request in vehicle_requests.items():
+            vehicle_priority = self.get_vehicle_priority(vehicle_id)
+            
+            # 将车辆优先级融入请求优先级
+            if 'priority' not in request:
+                request['priority'] = vehicle_priority
+            else:
+                # 融合优先级
+                request['priority'] = (request['priority'] * 0.7 + vehicle_priority * 0.3)
     
     def _update_ecbs_statistics(self, success: bool, solve_time: float):
         """更新ECBS统计信息"""
@@ -816,8 +899,11 @@ class OptimizedTrafficManagerWithECBS:
             recommendation['candidate_vehicles'] = all_active
             recommendation['coordination_type'] = 'batch'
             
-            # 评估协调优先级
-            if len(planning_vehicles) >= 2:
+            # 评估协调优先级 - 考虑车辆优先级
+            high_priority_count = len([vid for vid in all_active 
+                                     if self.get_vehicle_priority(vid) > 0.7])
+            
+            if high_priority_count >= 2 or len(planning_vehicles) >= 2:
                 recommendation['priority_level'] = 'high'
                 recommendation['estimated_benefit'] = 0.8
             else:
@@ -826,7 +912,8 @@ class OptimizedTrafficManagerWithECBS:
         
         return recommendation
     
-    # 保持原有的所有方法
+    # ==================== 基础交通管理功能 ====================
+    
     def register_vehicle_path(self, vehicle_id: str, path: List, 
                             start_time: float = 0, speed: float = 1.0) -> bool:
         """注册车辆路径"""
@@ -837,11 +924,15 @@ class OptimizedTrafficManagerWithECBS:
             # 移除旧路径
             self.release_vehicle_path(vehicle_id)
             
+            # 获取车辆优先级
+            priority = self.get_vehicle_priority(vehicle_id)
+            
             # 注册新路径
             path_info = {
                 'path': path,
                 'start_time': start_time,
                 'speed': speed,
+                'priority': priority,
                 'registered_time': time.time(),
                 'coordination_method': 'ecbs'  # 标记为ECBS协调路径
             }
@@ -889,15 +980,17 @@ class OptimizedTrafficManagerWithECBS:
         if len(involved_vehicles) < 2:
             return {vid: info['path'] for vid, info in self.active_paths.items()}
         
-        # 构建车辆请求
+        # 构建车辆请求 - 考虑优先级
         vehicle_requests = {}
         for vehicle_id in involved_vehicles:
             if vehicle_id in self.active_paths:
                 path = self.active_paths[vehicle_id]['path']
+                priority = self.get_vehicle_priority(vehicle_id)
+                
                 vehicle_requests[vehicle_id] = {
                     'start': path[0],
                     'goal': path[-1],
-                    'priority': 0.5
+                    'priority': priority
                 }
         
         # 使用ECBS重新协调
@@ -932,7 +1025,7 @@ class OptimizedTrafficManagerWithECBS:
                 del self.vehicle_predictions[vehicle_id]
             
             # 释放骨干网络资源
-            if self.backbone_network:
+            if self.backbone_network and hasattr(self.backbone_network, 'release_vehicle_from_path'):
                 self.backbone_network.release_vehicle_from_path(vehicle_id)
             
             return True
@@ -960,10 +1053,21 @@ class OptimizedTrafficManagerWithECBS:
         """获取统计信息"""
         stats = self.stats.copy()
         stats['active_vehicles'] = len(self.active_paths)
+        stats['managed_priorities'] = len(self.vehicle_priorities)
         
         # ECBS特有统计
         ecbs_stats = self.ecbs_solver.stats.copy()
         stats['ecbs_solver_stats'] = ecbs_stats
+        
+        # 优先级统计
+        if self.vehicle_priorities:
+            priorities = list(self.vehicle_priorities.values())
+            stats['priority_stats'] = {
+                'average_priority': sum(priorities) / len(priorities),
+                'max_priority': max(priorities),
+                'min_priority': min(priorities),
+                'high_priority_vehicles': len([p for p in priorities if p > 0.7])
+            }
         
         return stats
     
@@ -973,6 +1077,7 @@ class OptimizedTrafficManagerWithECBS:
             self.active_paths.clear()
             self.vehicle_predictions.clear()
             self.path_reservations.clear()
+            self.vehicle_priorities.clear()
     
     def shutdown(self):
         """关闭管理器"""
