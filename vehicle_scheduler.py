@@ -1,7 +1,6 @@
 """
-vehicle_scheduler.py - 修复增强版车辆调度器
-实现效率最大化算法、智能任务分配、动态优先级调整
-修复属性缺失问题，确保完全兼容
+vehicle_scheduler.py - 集成ECBS功能的完整增强版车辆调度器
+整合了效率最大化算法、智能任务分配、动态优先级调整和ECBS多车辆协调功能
 """
 
 import math
@@ -35,6 +34,13 @@ class TaskPriority(Enum):
     HIGH = 0.7
     URGENT = 0.9
     CRITICAL = 1.0
+
+class CoordinationMode(Enum):
+    """协调模式"""
+    SINGLE_VEHICLE = "single_vehicle"
+    BATCH_COORDINATION = "batch_coordination"
+    REAL_TIME_COORDINATION = "real_time_coordination"
+    PERIODIC_COORDINATION = "periodic_coordination"
 
 @dataclass
 class EnhancedTask:
@@ -80,7 +86,7 @@ class EnhancedTask:
 
 @dataclass
 class EnhancedVehicleState:
-    """增强车辆状态 - 修复版"""
+    """增强车辆状态"""
     vehicle_id: str
     status: VehicleStatus = VehicleStatus.IDLE
     position: Tuple[float, float, float] = (0, 0, 0)
@@ -113,23 +119,23 @@ class EnhancedVehicleState:
     last_conflict_time: float = 0.0
     conflict_resolution_success_rate: float = 1.0
     
-    # 效率统计 - 修复：添加所有缺失属性
+    # 效率统计
     total_distance: float = 0.0
     total_time: float = 0.0
     idle_time: float = 0.0
     productive_time: float = 0.0
     efficiency_history: List[float] = field(default_factory=list)
     backbone_usage_ratio: float = 0.0
-    average_speed: float = 0.0  # 修复：添加缺失的属性
+    average_speed: float = 0.0
     
-    # 新增：性能指标
+    # 性能指标
     last_efficiency_update: float = 0.0
     task_completion_count: int = 0
     
     def __post_init__(self):
         """初始化后处理"""
         if not self.efficiency_history:
-            self.efficiency_history = [0.5]  # 默认效率
+            self.efficiency_history = [0.5]
         if self.last_efficiency_update == 0.0:
             self.last_efficiency_update = time.time()
     
@@ -138,15 +144,10 @@ class EnhancedVehicleState:
         if not self.efficiency_history:
             return 0.5
         
-        # 历史效率平均值
         avg_efficiency = sum(self.efficiency_history) / len(self.efficiency_history)
-        
-        # 空载时间惩罚
         total_time = self.total_time if self.total_time > 0 else 1.0
         idle_ratio = self.idle_time / total_time
         idle_penalty = 1.0 - (idle_ratio * 0.5)
-        
-        # 骨干网络使用奖励
         backbone_bonus = 1.0 + (self.backbone_usage_ratio * 0.2)
         
         return avg_efficiency * idle_penalty * backbone_bonus
@@ -155,7 +156,6 @@ class EnhancedVehicleState:
         """更新效率历史"""
         self.efficiency_history.append(efficiency)
         
-        # 限制历史长度
         if len(self.efficiency_history) > 20:
             self.efficiency_history = self.efficiency_history[-10:]
         
@@ -183,11 +183,9 @@ class EnhancedVehicleState:
         
         if new_backbone_id and new_backbone_id != self.last_backbone_path_id:
             if self.last_backbone_path_id is not None:
-                # 发生了路径切换
                 self.backbone_switch_count += 1
                 self.last_backbone_switch_time = current_time
                 
-                # 降低稳定性分数
                 switch_penalty = 0.15 if self.backbone_switch_count <= 3 else 0.25
                 self.backbone_path_stability = max(0.1, 
                     self.backbone_path_stability - switch_penalty)
@@ -197,9 +195,8 @@ class EnhancedVehicleState:
             
             self.last_backbone_path_id = new_backbone_id
         elif new_backbone_id == self.last_backbone_path_id:
-            # 保持同一路径，提升稳定性
             time_since_switch = current_time - self.last_backbone_switch_time
-            if time_since_switch > 120:  # 2分钟稳定后开始恢复
+            if time_since_switch > 120:
                 stability_bonus = min(0.05, (time_since_switch - 120) / 3600 * 0.1)
                 self.backbone_path_stability = min(1.0, 
                     self.backbone_path_stability + stability_bonus)
@@ -209,7 +206,6 @@ class EnhancedVehicleState:
         self.conflict_count += 1
         self.last_conflict_time = time.time()
         
-        # 更新冲突解决成功率
         if resolved:
             success_count = getattr(self, '_conflict_success_count', 0) + 1
             setattr(self, '_conflict_success_count', success_count)
@@ -219,7 +215,6 @@ class EnhancedVehicleState:
                                    time_delta: float):
         """更新位置和相关指标"""
         if self.position and time_delta > 0:
-            # 计算移动距离
             distance = math.sqrt(
                 (new_position[0] - self.position[0])**2 +
                 (new_position[1] - self.position[1])**2
@@ -227,16 +222,277 @@ class EnhancedVehicleState:
             self.total_distance += distance
             self.total_time += time_delta
             
-            # 更新平均速度
             self.update_average_speed()
             
-            # 更新状态时间
             if self.status == VehicleStatus.IDLE:
                 self.idle_time += time_delta
             else:
                 self.productive_time += time_delta
         
         self.position = new_position
+
+@dataclass
+class CoordinationRequest:
+    """协调请求"""
+    request_id: str
+    vehicle_requests: Dict[str, Dict]
+    coordination_mode: CoordinationMode = CoordinationMode.BATCH_COORDINATION
+    max_solve_time: float = 30.0
+    quality_threshold: float = 0.7
+    prefer_backbone: bool = True
+    backbone_priority_weight: float = 0.3
+    allow_conflicts: bool = False
+    max_conflicts: int = 0
+
+@dataclass
+class CoordinationResult:
+    """协调结果"""
+    request_id: str
+    success: bool
+    coordinated_paths: Dict[str, List[Tuple]] = field(default_factory=dict)
+    path_structures: Dict[str, Dict] = field(default_factory=dict)
+    total_cost: float = 0.0
+    backbone_utilization: float = 0.0
+    conflict_count: int = 0
+    solve_time: float = 0.0
+    ecbs_expansions: int = 0
+    constraints_generated: int = 0
+    initial_conflicts: int = 0
+    final_conflicts: int = 0
+    error_message: Optional[str] = None
+
+class ECBSCoordinator:
+    """ECBS协调器 - 集成在调度器中"""
+    
+    def __init__(self, scheduler, traffic_manager, backbone_network):
+        self.scheduler = scheduler
+        self.traffic_manager = traffic_manager
+        self.backbone_network = backbone_network
+        
+        # ECBS参数
+        self.max_expansions = 500
+        self.timeout = 30.0
+        self.suboptimality_bound = 1.5
+        
+        # 协调统计
+        self.coordination_stats = {
+            'total_requests': 0,
+            'successful_coordinations': 0,
+            'average_solve_time': 0.0,
+            'average_conflict_reduction': 0.0,
+            'backbone_utilization_improvement': 0.0,
+            'ecbs_expansions_avg': 0.0
+        }
+        
+        # 缓存
+        self.coordination_cache = OrderedDict()
+        self.cache_limit = 100
+        
+        print("初始化ECBS协调器")
+    
+    def coordinate_vehicles(self, coordination_request: CoordinationRequest) -> CoordinationResult:
+        """主协调方法"""
+        start_time = time.time()
+        self.coordination_stats['total_requests'] += 1
+        
+        print(f"开始ECBS协调: {len(coordination_request.vehicle_requests)} 个车辆")
+        
+        # 检查缓存
+        cache_key = self._generate_cache_key(coordination_request)
+        if cache_key in self.coordination_cache:
+            cached_result = self.coordination_cache[cache_key]
+            print("使用缓存的协调结果")
+            return cached_result
+        
+        # 初始化结果
+        result = CoordinationResult(
+            request_id=coordination_request.request_id,
+            success=False
+        )
+        
+        try:
+            # 第一阶段：骨干路径预分配
+            backbone_allocations = self._allocate_backbone_paths(coordination_request)
+            
+            # 第二阶段：ECBS协调求解
+            if self.traffic_manager and hasattr(self.traffic_manager, 'ecbs_coordinate_paths'):
+                ecbs_result = self.traffic_manager.ecbs_coordinate_paths(
+                    coordination_request.vehicle_requests,
+                    backbone_allocations,
+                    max_solve_time=coordination_request.max_solve_time
+                )
+                
+                if ecbs_result and ecbs_result.get('success', False):
+                    result.success = True
+                    result.coordinated_paths = ecbs_result.get('paths', {})
+                    result.path_structures = ecbs_result.get('structures', {})
+                    result.total_cost = ecbs_result.get('total_cost', 0.0)
+                    result.conflict_count = ecbs_result.get('final_conflicts', 0)
+                    result.ecbs_expansions = ecbs_result.get('expansions', 0)
+                    result.constraints_generated = ecbs_result.get('constraints', 0)
+                    result.initial_conflicts = ecbs_result.get('initial_conflicts', 0)
+                    result.final_conflicts = ecbs_result.get('final_conflicts', 0)
+                    
+                    # 计算骨干网络利用率
+                    result.backbone_utilization = self._calculate_backbone_utilization(
+                        result.coordinated_paths
+                    )
+                    
+                    print(f"✅ ECBS协调成功: {result.conflict_count} 个冲突, "
+                          f"骨干利用率: {result.backbone_utilization:.2%}")
+                else:
+                    result.error_message = ecbs_result.get('error', 'ECBS求解失败')
+                    print(f"❌ ECBS协调失败: {result.error_message}")
+            else:
+                # 回退到单车辆规划
+                result = self._fallback_individual_planning(coordination_request)
+                
+        except Exception as e:
+            result.error_message = f"协调异常: {str(e)}"
+            print(f"协调异常: {e}")
+        
+        # 记录统计
+        result.solve_time = time.time() - start_time
+        self._update_coordination_stats(result)
+        
+        # 缓存结果
+        if result.success:
+            self._cache_result(cache_key, result)
+            self.coordination_stats['successful_coordinations'] += 1
+        
+        return result
+    
+    def _allocate_backbone_paths(self, request: CoordinationRequest) -> Dict[str, str]:
+        """骨干路径预分配"""
+        allocations = {}
+        
+        if not self.backbone_network or not request.prefer_backbone:
+            return allocations
+        
+        sorted_requests = sorted(
+            request.vehicle_requests.items(),
+            key=lambda x: x[1].get('priority', 0.5),
+            reverse=True
+        )
+        
+        print(f"为 {len(sorted_requests)} 个车辆分配骨干路径")
+        
+        for vehicle_id, vehicle_request in sorted_requests:
+            try:
+                if hasattr(self.backbone_network, 'get_path_from_position_to_target'):
+                    target_type = 'unloading'
+                    target_id = 0
+                    
+                    path_result = self.backbone_network.get_path_from_position_to_target(
+                        vehicle_request['start'],
+                        target_type,
+                        target_id,
+                        vehicle_id
+                    )
+                    
+                    if path_result and isinstance(path_result, tuple) and len(path_result) > 1:
+                        path_structure = path_result[1]
+                        backbone_path_id = path_structure.get('path_id')
+                        if backbone_path_id:
+                            allocations[vehicle_id] = backbone_path_id
+                            print(f"  车辆 {vehicle_id} -> 骨干路径 {backbone_path_id}")
+                        
+            except Exception as e:
+                print(f"为车辆 {vehicle_id} 分配骨干路径失败: {e}")
+        
+        return allocations
+    
+    def _calculate_backbone_utilization(self, paths: Dict[str, List[Tuple]]) -> float:
+        """计算骨干网络利用率"""
+        if not paths or not self.backbone_network:
+            return 0.0
+        
+        total_backbone_usage = 0.0
+        total_vehicles = len(paths)
+        
+        for vehicle_id, path in paths.items():
+            if hasattr(self.backbone_network, 'analyze_path_backbone_usage'):
+                try:
+                    usage_info = self.backbone_network.analyze_path_backbone_usage(path, vehicle_id)
+                    total_backbone_usage += usage_info.get('utilization_ratio', 0.0)
+                except:
+                    pass
+        
+        return total_backbone_usage / max(1, total_vehicles)
+    
+    def _fallback_individual_planning(self, request: CoordinationRequest) -> CoordinationResult:
+        """回退到单车辆规划"""
+        result = CoordinationResult(
+            request_id=request.request_id,
+            success=True
+        )
+        
+        print("回退到单车辆规划模式")
+        
+        for vehicle_id, vehicle_request in request.vehicle_requests.items():
+            try:
+                if self.scheduler.path_planner:
+                    path_result = self.scheduler.path_planner.plan_path(
+                        vehicle_id=vehicle_id,
+                        start=vehicle_request['start'],
+                        goal=vehicle_request['goal'],
+                        use_backbone=request.prefer_backbone
+                    )
+                    
+                    if path_result:
+                        if isinstance(path_result, tuple):
+                            path, structure = path_result
+                        else:
+                            path = path_result
+                            structure = {'type': 'individual'}
+                        
+                        result.coordinated_paths[vehicle_id] = path
+                        result.path_structures[vehicle_id] = structure
+                        
+            except Exception as e:
+                print(f"单车辆规划失败 {vehicle_id}: {e}")
+        
+        return result
+    
+    def _generate_cache_key(self, request: CoordinationRequest) -> str:
+        """生成缓存键"""
+        vehicles_str = "_".join(sorted(request.vehicle_requests.keys()))
+        return f"{vehicles_str}_{request.coordination_mode.value}_{request.max_solve_time}"
+    
+    def _cache_result(self, cache_key: str, result: CoordinationResult):
+        """缓存结果"""
+        if len(self.coordination_cache) >= self.cache_limit:
+            self.coordination_cache.popitem(last=False)
+        
+        self.coordination_cache[cache_key] = result
+    
+    def _update_coordination_stats(self, result: CoordinationResult):
+        """更新协调统计"""
+        stats = self.coordination_stats
+        
+        total_requests = stats['total_requests']
+        if total_requests > 1:
+            stats['average_solve_time'] = (
+                stats['average_solve_time'] * (total_requests - 1) + result.solve_time
+            ) / total_requests
+        else:
+            stats['average_solve_time'] = result.solve_time
+        
+        if result.success:
+            stats['average_conflict_reduction'] = (
+                stats['average_conflict_reduction'] * 0.9 + 
+                (max(0, result.initial_conflicts - result.final_conflicts) / max(1, result.initial_conflicts)) * 0.1
+            )
+            
+            stats['backbone_utilization_improvement'] = (
+                stats['backbone_utilization_improvement'] * 0.9 + 
+                result.backbone_utilization * 0.1
+            )
+            
+            stats['ecbs_expansions_avg'] = (
+                stats['ecbs_expansions_avg'] * 0.9 + 
+                result.ecbs_expansions * 0.1
+            )
 
 class SystemEfficiencyOptimizer:
     """系统效率优化器"""
@@ -274,16 +530,13 @@ class SystemEfficiencyOptimizer:
         """判断是否需要系统优化"""
         current_time = time.time()
         
-        # 时间间隔检查
         if current_time - self.last_optimization_time < self.optimization_config['optimization_interval']:
             return False
         
-        # 效率阈值检查
         current_efficiency = self.calculate_system_efficiency()
         if current_efficiency < self.optimization_config['rebalancing_threshold']:
             return True
         
-        # 负载不平衡检查
         if self._detect_load_imbalance():
             return True
         
@@ -294,23 +547,17 @@ class SystemEfficiencyOptimizer:
         if not self.scheduler.vehicle_states:
             return 0.0
         
-        # 1. 任务完成效率
         total_tasks = self.scheduler.stats['total_tasks']
         completed_tasks = self.scheduler.stats['completed_tasks']
         task_completion_rate = completed_tasks / max(1, total_tasks)
         
-        # 2. 车辆利用率
         vehicle_efficiencies = [v.calculate_efficiency_score() 
                                for v in self.scheduler.vehicle_states.values()]
         avg_vehicle_efficiency = sum(vehicle_efficiencies) / len(vehicle_efficiencies) if vehicle_efficiencies else 0.0
         
-        # 3. 骨干网络利用率
         backbone_utilization = self._calculate_backbone_utilization()
-        
-        # 4. 平均任务时间效率
         avg_task_efficiency = self._calculate_average_task_efficiency()
         
-        # 综合效率分数
         system_efficiency = (
             task_completion_rate * 0.3 +
             avg_vehicle_efficiency * 0.3 +
@@ -318,7 +565,6 @@ class SystemEfficiencyOptimizer:
             avg_task_efficiency * 0.2
         )
         
-        # 更新系统指标
         self.system_metrics.update({
             'overall_efficiency': system_efficiency,
             'vehicle_utilization': avg_vehicle_efficiency,
@@ -357,7 +603,6 @@ class SystemEfficiencyOptimizer:
         if not self.scheduler.vehicle_states:
             return False
         
-        # 计算车辆效率标准差
         efficiencies = [v.calculate_efficiency_score() 
                        for v in self.scheduler.vehicle_states.values()]
         
@@ -385,26 +630,21 @@ class SystemEfficiencyOptimizer:
             'optimization_time': 0.0
         }
         
-        # 记录优化前效率
         initial_efficiency = self.calculate_system_efficiency()
         
         try:
-            # 1. 车辆负载重平衡
             rebalancing_result = self._rebalance_vehicle_loads()
             optimization_results['vehicle_rebalancing'] = rebalancing_result
             
-            # 2. 任务重新分配
             reassignment_result = self._optimize_task_assignments()
             optimization_results['task_reassignments'] = reassignment_result
             
-            # 3. 骨干网络路径优化
             backbone_result = self._optimize_backbone_usage()
             optimization_results['backbone_optimizations'] = backbone_result
             
         except Exception as e:
             print(f"优化过程出错: {e}")
         
-        # 4. 计算优化效果
         final_efficiency = self.calculate_system_efficiency()
         efficiency_improvement = final_efficiency - initial_efficiency
         optimization_results['efficiency_improvement'] = efficiency_improvement
@@ -412,7 +652,6 @@ class SystemEfficiencyOptimizer:
         optimization_time = time.time() - optimization_start
         optimization_results['optimization_time'] = optimization_time
         
-        # 记录优化历史
         self.optimization_history.append({
             'timestamp': optimization_start,
             'initial_efficiency': initial_efficiency,
@@ -421,7 +660,6 @@ class SystemEfficiencyOptimizer:
             'results': optimization_results
         })
         
-        # 限制历史长度
         if len(self.optimization_history) > 50:
             self.optimization_history = self.optimization_history[-25:]
         
@@ -433,7 +671,6 @@ class SystemEfficiencyOptimizer:
         """重平衡车辆负载"""
         rebalanced_count = 0
         
-        # 找到效率最高和最低的车辆
         vehicle_efficiencies = [(vid, v.calculate_efficiency_score()) 
                                for vid, v in self.scheduler.vehicle_states.items()]
         
@@ -442,25 +679,20 @@ class SystemEfficiencyOptimizer:
         
         vehicle_efficiencies.sort(key=lambda x: x[1])
         
-        # 从低效率车辆转移任务到高效率车辆
         low_efficiency_vehicles = vehicle_efficiencies[:len(vehicle_efficiencies)//3]
         high_efficiency_vehicles = vehicle_efficiencies[-len(vehicle_efficiencies)//3:]
         
         for low_vid, low_eff in low_efficiency_vehicles:
             low_vehicle = self.scheduler.vehicle_states[low_vid]
             
-            # 如果低效率车辆有排队任务，尝试转移
             if len(low_vehicle.task_queue) > 1:
                 for high_vid, high_eff in high_efficiency_vehicles:
                     high_vehicle = self.scheduler.vehicle_states[high_vid]
                     
-                    # 如果高效率车辆任务较少，转移任务
                     if len(high_vehicle.task_queue) < len(low_vehicle.task_queue) - 1:
-                        # 转移一个任务
                         task_to_transfer = low_vehicle.task_queue.pop()
                         high_vehicle.task_queue.append(task_to_transfer)
                         
-                        # 更新任务分配
                         if task_to_transfer in self.scheduler.tasks:
                             self.scheduler.tasks[task_to_transfer].assigned_vehicle = high_vid
                         
@@ -472,14 +704,14 @@ class SystemEfficiencyOptimizer:
     
     def _optimize_task_assignments(self) -> int:
         """优化任务分配"""
-        return 0  # 简化实现，避免复杂错误
+        return 0  # 简化实现
     
     def _optimize_backbone_usage(self) -> int:
         """优化骨干网络使用"""
-        return 0  # 简化实现，避免复杂错误
+        return 0  # 简化实现
 
 class EnhancedVehicleScheduler:
-    """增强版车辆调度器 - 修复版"""
+    """集成ECBS功能的增强版车辆调度器"""
     
     def __init__(self, env, path_planner=None, backbone_network=None, traffic_manager=None):
         # 核心组件
@@ -504,6 +736,27 @@ class EnhancedVehicleScheduler:
         # 状态锁
         self.state_lock = threading.RLock()
         
+        # ECBS协调器 - 集成功能
+        self.ecbs_coordinator = ECBSCoordinator(self, traffic_manager, backbone_network)
+        
+        # 协调配置
+        self.coordination_config = {
+            'enable_ecbs': True,
+            'default_coordination_mode': CoordinationMode.BATCH_COORDINATION,
+            'coordination_trigger_threshold': 3,
+            'coordination_interval': 120.0,
+            'max_coordination_time': 30.0,
+            'prefer_backbone_in_coordination': True
+        }
+        
+        # 协调状态
+        self.coordination_state = {
+            'last_coordination_time': 0,
+            'pending_coordination_requests': [],
+            'active_coordinations': {},
+            'coordination_queue': deque()
+        }
+        
         # 增强统计
         self.stats = {
             'total_tasks': 0,
@@ -514,7 +767,13 @@ class EnhancedVehicleScheduler:
             'backbone_usage_count': 0,
             'optimization_cycles': 0,
             'average_task_time': 0.0,
-            'system_efficiency_trend': []
+            'system_efficiency_trend': [],
+            # ECBS相关统计
+            'ecbs_coordinations': 0,
+            'ecbs_success_rate': 0.0,
+            'avg_coordination_time': 0.0,
+            'conflict_reduction_rate': 0.0,
+            'backbone_utilization_improvement': 0.0
         }
         
         # 性能监控
@@ -524,20 +783,270 @@ class EnhancedVehicleScheduler:
             'performance_alerts': []
         }
         
-        print("初始化修复版增强车辆调度器")
+        print("初始化集成ECBS功能的增强车辆调度器")
+    
+    # ==================== ECBS协调功能 ====================
+    
+    def coordinate_multiple_vehicles(self, vehicle_ids: List[str], 
+                                   mission_templates: Dict[str, str] = None,
+                                   coordination_mode: CoordinationMode = None,
+                                   priority: TaskPriority = TaskPriority.NORMAL) -> bool:
+        """批量协调多个车辆 - ECBS核心功能"""
+        
+        if not self.coordination_config['enable_ecbs'] or len(vehicle_ids) < 2:
+            return self._assign_individual_missions(vehicle_ids, mission_templates, priority)
+        
+        print(f"开始多车辆协调: {len(vehicle_ids)} 个车辆")
+        
+        try:
+            coordination_request = self._prepare_coordination_request(
+                vehicle_ids, mission_templates, coordination_mode, priority
+            )
+            
+            if not coordination_request:
+                print("协调请求准备失败，回退到单车辆分配")
+                return self._assign_individual_missions(vehicle_ids, mission_templates, priority)
+            
+            result = self.ecbs_coordinator.coordinate_vehicles(coordination_request)
+            
+            if result.success:
+                return self._apply_coordination_result(result, vehicle_ids, priority)
+            else:
+                print(f"ECBS协调失败: {result.error_message}")
+                return self._assign_individual_missions(vehicle_ids, mission_templates, priority)
+                
+        except Exception as e:
+            print(f"多车辆协调异常: {e}")
+            return self._assign_individual_missions(vehicle_ids, mission_templates, priority)
+    
+    def _prepare_coordination_request(self, vehicle_ids: List[str], 
+                                    mission_templates: Dict[str, str],
+                                    coordination_mode: CoordinationMode,
+                                    priority: TaskPriority) -> Optional[CoordinationRequest]:
+        """准备协调请求"""
+        
+        if coordination_mode is None:
+            coordination_mode = self.coordination_config['default_coordination_mode']
+        
+        vehicle_requests = {}
+        
+        for vehicle_id in vehicle_ids:
+            if vehicle_id not in self.vehicle_states:
+                print(f"车辆 {vehicle_id} 不存在")
+                continue
+            
+            vehicle_state = self.vehicle_states[vehicle_id]
+            template_id = mission_templates.get(vehicle_id, 'default') if mission_templates else 'default'
+            
+            if template_id not in self.mission_templates:
+                if not self.create_enhanced_mission_template(template_id, priority=priority):
+                    print(f"创建任务模板失败: {template_id}")
+                    continue
+            
+            template = self.mission_templates[template_id]
+            start = vehicle_state.position
+            goal = template['loading_position']
+            
+            vehicle_requests[vehicle_id] = {
+                'start': start,
+                'goal': goal,
+                'priority': priority.value,
+                'deadline': time.time() + 300,
+                'template_id': template_id
+            }
+        
+        if not vehicle_requests:
+            return None
+        
+        return CoordinationRequest(
+            request_id=f"coord_{int(time.time())}",
+            vehicle_requests=vehicle_requests,
+            coordination_mode=coordination_mode,
+            max_solve_time=self.coordination_config['max_coordination_time'],
+            prefer_backbone=self.coordination_config['prefer_backbone_in_coordination']
+        )
+    
+    def _apply_coordination_result(self, result: CoordinationResult, 
+                                 vehicle_ids: List[str], priority: TaskPriority) -> bool:
+        """应用协调结果"""
+        
+        success_count = 0
+        
+        with self.state_lock:
+            for vehicle_id in vehicle_ids:
+                if vehicle_id not in result.coordinated_paths:
+                    continue
+                
+                try:
+                    if self._create_coordinated_task(
+                        vehicle_id, result.coordinated_paths[vehicle_id],
+                        result.path_structures.get(vehicle_id, {}), priority
+                    ):
+                        success_count += 1
+                        
+                except Exception as e:
+                    print(f"应用协调结果失败 {vehicle_id}: {e}")
+        
+        # 更新统计
+        if success_count > 0:
+            self.stats['ecbs_coordinations'] += 1
+            self.stats['ecbs_success_rate'] = (
+                self.stats['ecbs_success_rate'] * 0.9 + 
+                (success_count / len(vehicle_ids)) * 0.1
+            )
+            self.stats['avg_coordination_time'] = (
+                self.stats['avg_coordination_time'] * 0.9 + 
+                result.solve_time * 0.1
+            )
+            self.stats['backbone_utilization_improvement'] = (
+                self.stats['backbone_utilization_improvement'] * 0.9 + 
+                result.backbone_utilization * 0.1
+            )
+        
+        print(f"协调结果应用完成: {success_count}/{len(vehicle_ids)} 成功")
+        return success_count > 0
+    
+    def _create_coordinated_task(self, vehicle_id: str, coordinated_path: List[Tuple],
+                               path_structure: Dict, priority: TaskPriority) -> bool:
+        """创建协调任务"""
+        
+        task_id = f"coordinated_task_{self.task_counter}"
+        self.task_counter += 1
+        
+        task = EnhancedTask(
+            task_id=task_id,
+            task_type='coordinated_mission',
+            start=coordinated_path[0],
+            goal=coordinated_path[-1],
+            priority=priority,
+            path=coordinated_path,
+            path_structure=path_structure
+        )
+        
+        if path_structure:
+            task.backbone_utilization = path_structure.get('backbone_utilization', 0.0)
+        
+        self.tasks[task_id] = task
+        self.active_assignments[vehicle_id].append(task_id)
+        self.stats['total_tasks'] += 1
+        
+        vehicle_state = self.vehicle_states[vehicle_id]
+        vehicle_state.task_queue.append(task_id)
+        
+        if vehicle_state.status == VehicleStatus.IDLE:
+            return self._start_task_execution(task_id, vehicle_id)
+        
+        return True
+    
+    def _assign_individual_missions(self, vehicle_ids: List[str], 
+                                  mission_templates: Dict[str, str],
+                                  priority: TaskPriority) -> bool:
+        """回退到单车辆任务分配"""
+        
+        success_count = 0
+        
+        for vehicle_id in vehicle_ids:
+            template_id = mission_templates.get(vehicle_id, 'default') if mission_templates else 'default'
+            
+            if self.assign_mission_intelligently(vehicle_id, template_id, priority):
+                success_count += 1
+        
+        return success_count > 0
+    
+    def trigger_periodic_coordination(self) -> bool:
+        """触发定期协调"""
+        
+        current_time = time.time()
+        
+        if (current_time - self.coordination_state['last_coordination_time'] < 
+            self.coordination_config['coordination_interval']):
+            return False
+        
+        coordination_candidates = self._find_coordination_candidates()
+        
+        if len(coordination_candidates) >= self.coordination_config['coordination_trigger_threshold']:
+            print(f"触发定期协调: {len(coordination_candidates)} 个车辆")
+            
+            success = self.coordinate_multiple_vehicles(
+                coordination_candidates,
+                coordination_mode=CoordinationMode.PERIODIC_COORDINATION
+            )
+            
+            self.coordination_state['last_coordination_time'] = current_time
+            return success
+        
+        return False
+    
+    def _find_coordination_candidates(self) -> List[str]:
+        """找到协调候选车辆"""
+        candidates = []
+        
+        for vehicle_id, vehicle_state in self.vehicle_states.items():
+            if (vehicle_state.status == VehicleStatus.IDLE or 
+                (vehicle_state.current_task and 
+                 self._is_task_near_completion(vehicle_state.current_task))):
+                candidates.append(vehicle_id)
+        
+        return candidates
+    
+    def _is_task_near_completion(self, task_id: str) -> bool:
+        """判断任务是否接近完成"""
+        if task_id not in self.tasks:
+            return False
+        
+        task = self.tasks[task_id]
+        
+        if task.estimated_duration > 0:
+            elapsed = time.time() - task.start_time
+            return elapsed > task.estimated_duration * 0.8
+        
+        return False
+    
+    def get_coordination_statistics(self) -> Dict:
+        """获取协调统计信息"""
+        ecbs_stats = self.ecbs_coordinator.coordination_stats.copy()
+        
+        return {
+            'ecbs_coordinator': ecbs_stats,
+            'coordination_config': self.coordination_config.copy(),
+            'coordination_state': {
+                'last_coordination_time': self.coordination_state['last_coordination_time'],
+                'pending_requests': len(self.coordination_state['pending_coordination_requests']),
+                'active_coordinations': len(self.coordination_state['active_coordinations'])
+            },
+            'performance_metrics': {
+                'ecbs_coordinations': self.stats['ecbs_coordinations'],
+                'ecbs_success_rate': self.stats['ecbs_success_rate'],
+                'avg_coordination_time': self.stats['avg_coordination_time'],
+                'conflict_reduction_rate': self.stats['conflict_reduction_rate'],
+                'backbone_utilization_improvement': self.stats['backbone_utilization_improvement']
+            }
+        }
+    
+    def enable_ecbs_coordination(self, enable: bool = True):
+        """启用/禁用ECBS协调"""
+        self.coordination_config['enable_ecbs'] = enable
+        print(f"ECBS协调: {'启用' if enable else '禁用'}")
+    
+    def set_coordination_parameters(self, **kwargs):
+        """设置协调参数"""
+        for key, value in kwargs.items():
+            if key in self.coordination_config:
+                self.coordination_config[key] = value
+                print(f"更新协调参数 {key}: {value}")
+    
+    # ==================== 基础调度功能 ====================
     
     def initialize_vehicles(self):
         """初始化车辆状态"""
         with self.state_lock:
             for vehicle_id, vehicle_data in self.env.vehicles.items():
                 try:
-                    # 获取车辆位置
                     if hasattr(vehicle_data, 'position'):
                         position = vehicle_data.position
                     else:
                         position = vehicle_data.get('position', (0, 0, 0))
                     
-                    # 获取车辆参数
                     if hasattr(vehicle_data, 'max_load'):
                         max_load = vehicle_data.max_load
                     else:
@@ -561,7 +1070,6 @@ class EnhancedVehicleScheduler:
                         safety_margin = 1.5
                         turning_radius = 8.0
                     
-                    # 创建增强车辆状态
                     self.vehicle_states[vehicle_id] = EnhancedVehicleState(
                         vehicle_id=vehicle_id,
                         position=position,
@@ -576,13 +1084,11 @@ class EnhancedVehicleScheduler:
                     
                     self.active_assignments[vehicle_id] = []
                     
-                    # 设置交通管理器的车辆优先级
                     if self.traffic_manager:
                         self.traffic_manager.set_vehicle_priority(vehicle_id, 0.5)
                     
                 except Exception as e:
                     print(f"初始化车辆 {vehicle_id} 失败: {e}")
-                    # 创建最小化车辆状态
                     self.vehicle_states[vehicle_id] = EnhancedVehicleState(
                         vehicle_id=vehicle_id,
                         position=(10, 10, 0),
@@ -603,13 +1109,11 @@ class EnhancedVehicleScheduler:
                 print("缺少装载点或卸载点")
                 return False
             
-            # 选择装载点和卸载点
             if loading_point_id is None:
                 loading_point_id = 0
             if unloading_point_id is None:
                 unloading_point_id = 0
             
-            # 验证有效性
             if (loading_point_id >= len(self.env.loading_points) or 
                 unloading_point_id >= len(self.env.unloading_points)):
                 print(f"点ID超出范围: L{loading_point_id}, U{unloading_point_id}")
@@ -618,7 +1122,6 @@ class EnhancedVehicleScheduler:
             loading_point = self.env.loading_points[loading_point_id]
             unloading_point = self.env.unloading_points[unloading_point_id]
             
-            # 创建增强模板
             template = {
                 'loading_point_id': loading_point_id,
                 'unloading_point_id': unloading_point_id,
@@ -661,7 +1164,6 @@ class EnhancedVehicleScheduler:
         """智能任务分配"""
         with self.state_lock:
             try:
-                # 智能车辆选择
                 if vehicle_id is None:
                     vehicle_id = self._select_optimal_vehicle(priority)
                     if not vehicle_id:
@@ -672,7 +1174,6 @@ class EnhancedVehicleScheduler:
                     print(f"车辆 {vehicle_id} 不存在")
                     return False
                 
-                # 创建默认模板
                 if template_id not in self.mission_templates:
                     if not self.create_enhanced_mission_template(template_id, priority=priority):
                         print("创建任务模板失败")
@@ -681,7 +1182,6 @@ class EnhancedVehicleScheduler:
                 template = self.mission_templates[template_id]
                 vehicle_state = self.vehicle_states[vehicle_id]
                 
-                # 生成增强任务序列
                 created_tasks = []
                 current_position = vehicle_state.position
                 current_time = time.time()
@@ -690,16 +1190,13 @@ class EnhancedVehicleScheduler:
                     task_id = f"task_{self.task_counter}"
                     self.task_counter += 1
                     
-                    # 确定目标位置
                     if task_template['goal'] is None:
                         goal = vehicle_state.position
                     else:
                         goal = task_template['goal']
                     
-                    # 计算截止时间
                     deadline = current_time + task_template['estimated_duration'] * 2
                     
-                    # 创建增强任务
                     task = EnhancedTask(
                         task_id=task_id,
                         task_type=task_template['task_type'],
@@ -714,17 +1211,13 @@ class EnhancedVehicleScheduler:
                     created_tasks.append(task_id)
                     current_position = goal
                     
-                    # 添加到优先级队列
                     heapq.heappush(self.task_priority_queue, (-task.priority.value, task_id))
                 
-                # 分配给车辆
                 self.active_assignments[vehicle_id].extend(created_tasks)
                 self.stats['total_tasks'] += len(created_tasks)
                 
-                # 更新车辆优先级
                 self._update_vehicle_priority(vehicle_id, priority)
                 
-                # 开始第一个任务
                 if vehicle_state.status == VehicleStatus.IDLE:
                     self._start_next_task(vehicle_id)
                 
@@ -747,7 +1240,6 @@ class EnhancedVehicleScheduler:
         best_score = float('inf')
         
         for vehicle_id, vehicle_state in available_vehicles:
-            # 计算分配分数（越小越好）
             efficiency_score = 1.0 - vehicle_state.calculate_efficiency_score()
             queue_score = len(vehicle_state.task_queue) / 10.0
             priority_diff = abs(vehicle_state.priority_level - task_priority.value)
@@ -768,11 +1260,9 @@ class EnhancedVehicleScheduler:
         """更新车辆优先级"""
         vehicle_state = self.vehicle_states[vehicle_id]
         
-        # 动态调整车辆优先级
         new_priority = (vehicle_state.priority_level * 0.7 + task_priority.value * 0.3)
         vehicle_state.priority_level = min(1.0, max(0.1, new_priority))
         
-        # 同步到交通管理器
         if self.traffic_manager:
             self.traffic_manager.set_vehicle_priority(vehicle_id, vehicle_state.priority_level)
     
@@ -785,7 +1275,6 @@ class EnhancedVehicleScheduler:
         if not assignments:
             return False
         
-        # 按优先级选择任务
         next_task_id = None
         highest_priority = -1
         
@@ -809,17 +1298,14 @@ class EnhancedVehicleScheduler:
         task = self.tasks[task_id]
         vehicle_state = self.vehicle_states[vehicle_id]
         
-        # 更新任务状态
         task.status = TaskStatus.IN_PROGRESS
         task.assigned_vehicle = vehicle_id
         task.assignment_time = time.time()
         task.start_time = time.time()
         
-        # 更新车辆状态
         vehicle_state.status = VehicleStatus.PLANNING
         vehicle_state.current_task = task_id
         
-        # 同步到环境
         try:
             if vehicle_id in self.env.vehicles:
                 if hasattr(self.env.vehicles[vehicle_id], 'status'):
@@ -829,7 +1315,6 @@ class EnhancedVehicleScheduler:
         except Exception as e:
             print(f"同步环境状态失败: {e}")
         
-        # 执行路径规划
         return self._plan_and_start_enhanced_task(task, vehicle_state)
     
     def _plan_and_start_enhanced_task(self, task: EnhancedTask, 
@@ -842,14 +1327,12 @@ class EnhancedVehicleScheduler:
         try:
             task.planning_attempts += 1
             
-            # 根据任务优先级选择规划策略
             context = "navigation"
             if task.priority in [TaskPriority.URGENT, TaskPriority.CRITICAL]:
                 context = "emergency"
             elif task.priority == TaskPriority.HIGH:
                 context = "backbone"
             
-            # 准备车辆参数
             vehicle_params = vehicle_state.get_safety_params()
             
             result = self.path_planner.plan_path(
@@ -862,14 +1345,12 @@ class EnhancedVehicleScheduler:
             )
             
             if result:
-                # 处理规划结果
                 if isinstance(result, tuple):
                     task.path, task.path_structure = result
                 else:
                     task.path = result
                     task.path_structure = {'type': 'direct'}
                 
-                # 计算骨干网络利用率
                 if task.path_structure:
                     task.backbone_utilization = task.path_structure.get('backbone_utilization', 0.0)
                     vehicle_state.backbone_usage_ratio = (
@@ -877,19 +1358,16 @@ class EnhancedVehicleScheduler:
                         task.backbone_utilization * 0.2
                     )
                 
-                # 注册到交通管理器
                 if self.traffic_manager:
                     self.traffic_manager.register_vehicle_path(
                         vehicle_state.vehicle_id, task.path, task.start_time
                     )
                 
-                # 开始移动
                 return self._start_enhanced_movement(task, vehicle_state)
             
         except Exception as e:
             print(f"任务 {task.task_id} 规划失败: {e}")
         
-        # 规划失败
         task.status = TaskStatus.FAILED
         vehicle_state.status = VehicleStatus.IDLE
         self.stats['failed_tasks'] += 1
@@ -901,18 +1379,14 @@ class EnhancedVehicleScheduler:
         if not task.path:
             return False
         
-        # 更新状态
         vehicle_state.status = VehicleStatus.MOVING
         
-        # 提取骨干路径ID
         backbone_id = None
         if task.path_structure:
             backbone_id = task.path_structure.get('path_id')
         
-        # 更新骨干路径稳定性
         vehicle_state.update_backbone_stability(backbone_id)
         
-        # 同步到环境
         try:
             if vehicle_state.vehicle_id in self.env.vehicles:
                 env_vehicle = self.env.vehicles[vehicle_state.vehicle_id]
@@ -955,31 +1429,33 @@ class EnhancedVehicleScheduler:
                     self.stats['optimization_cycles'] += 1
                 except Exception as e:
                     print(f"系统优化失败: {e}")
+            
+            # ECBS定期协调检查
+            try:
+                if self.coordination_config['enable_ecbs']:
+                    self.trigger_periodic_coordination()
+            except Exception as e:
+                print(f"定期协调检查失败: {e}")
     
     def _update_enhanced_vehicle(self, vehicle_id: str, vehicle_state: EnhancedVehicleState, 
                                time_delta: float):
         """更新增强车辆"""
         try:
-            # 同步环境数据
             if vehicle_id in self.env.vehicles:
                 env_vehicle = self.env.vehicles[vehicle_id]
                 
-                # 获取位置
                 if hasattr(env_vehicle, 'position'):
                     new_position = env_vehicle.position
                 else:
                     new_position = env_vehicle.get('position', vehicle_state.position)
                 
-                # 更新位置和指标
                 vehicle_state.update_position_and_metrics(new_position, time_delta)
                 
-                # 获取负载
                 if hasattr(env_vehicle, 'current_load'):
                     vehicle_state.current_load = env_vehicle.current_load
                 else:
                     vehicle_state.current_load = env_vehicle.get('load', vehicle_state.current_load)
                 
-                # 状态映射
                 if hasattr(env_vehicle, 'status'):
                     env_status = env_vehicle.status
                 else:
@@ -997,11 +1473,9 @@ class EnhancedVehicleScheduler:
                 if not vehicle_state.current_task:
                     vehicle_state.status = status_map.get(env_status, VehicleStatus.IDLE)
             
-            # 处理当前任务
             if vehicle_state.current_task:
                 self._update_enhanced_task_execution(vehicle_state, time_delta)
             elif vehicle_state.status == VehicleStatus.IDLE:
-                # 尝试开始下一个任务
                 self._start_next_task(vehicle_id)
                 
         except Exception as e:
@@ -1035,7 +1509,6 @@ class EnhancedVehicleScheduler:
             else:
                 progress = env_vehicle.get('progress', 0.0)
             
-            # 计算新进度
             if task.path and len(task.path) > 1:
                 path_length = self._calculate_path_length(task.path)
                 if path_length > 0:
@@ -1044,13 +1517,11 @@ class EnhancedVehicleScheduler:
                     progress_increment = distance_increment / path_length
                     new_progress = min(1.0, progress + progress_increment)
                     
-                    # 更新进度
                     if hasattr(env_vehicle, 'progress'):
                         env_vehicle.progress = new_progress
                     else:
                         env_vehicle['progress'] = new_progress
                     
-                    # 更新位置
                     if new_progress < 1.0:
                         new_position = self._interpolate_position(task.path, new_progress)
                         if hasattr(env_vehicle, 'position'):
@@ -1059,7 +1530,6 @@ class EnhancedVehicleScheduler:
                             env_vehicle['position'] = new_position
                         vehicle_state.position = new_position
                     
-                    # 检查到达
                     if new_progress >= 0.95:
                         self._handle_enhanced_arrival(task, vehicle_state)
                         
@@ -1131,30 +1601,22 @@ class EnhancedVehicleScheduler:
     def _complete_enhanced_task(self, task: EnhancedTask, 
                               vehicle_state: EnhancedVehicleState):
         """完成任务"""
-        # 更新任务状态
         task.status = TaskStatus.COMPLETED
         task.completion_time = time.time()
         task.actual_duration = task.completion_time - task.start_time
         
-        # 计算任务效率
         task.efficiency_score = task.calculate_efficiency()
-        
-        # 更新车辆效率历史
         vehicle_state.update_efficiency_history(task.efficiency_score)
         
-        # 更新统计
         self.stats['completed_tasks'] += 1
         self.stats['total_efficiency_score'] += task.efficiency_score
         
-        # 从分配中移除
         if task.task_id in self.active_assignments[vehicle_state.vehicle_id]:
             self.active_assignments[vehicle_state.vehicle_id].remove(task.task_id)
         
-        # 释放交通管理器资源
         if self.traffic_manager:
             self.traffic_manager.release_vehicle_path(vehicle_state.vehicle_id)
         
-        # 清理车辆状态
         vehicle_state.current_task = None
         vehicle_state.status = VehicleStatus.IDLE
         vehicle_state.task_completion_count += 1
@@ -1163,7 +1625,6 @@ class EnhancedVehicleScheduler:
         
         print(f"任务 {task.task_id} 完成，效率: {task.efficiency_score:.2f}")
         
-        # 开始下一个任务
         self._start_next_task(vehicle_state.vehicle_id)
     
     def _increment_enhanced_cycle(self, vehicle_state: EnhancedVehicleState):
@@ -1181,11 +1642,10 @@ class EnhancedVehicleScheduler:
             print(f"同步循环计数失败: {e}")
         
         print(f"车辆 {vehicle_state.vehicle_id} 完成第 {vehicle_state.completed_cycles} 个循环")
-    
+        
     def _auto_assign_next_cycle(self, vehicle_id: str):
         """自动分配下一个循环"""
         if not self.active_assignments[vehicle_id]:
-            # 根据车辆效率动态调整优先级
             vehicle_state = self.vehicle_states[vehicle_id]
             efficiency = vehicle_state.calculate_efficiency_score()
             
@@ -1196,7 +1656,6 @@ class EnhancedVehicleScheduler:
             else:
                 priority = TaskPriority.LOW
             
-            # 自动分配新循环
             self.assign_mission_intelligently(vehicle_id, "default", priority)
     
     def _perform_efficiency_check(self):
@@ -1204,17 +1663,14 @@ class EnhancedVehicleScheduler:
         try:
             current_efficiency = self.efficiency_optimizer.calculate_system_efficiency()
             
-            # 记录效率趋势
             self.stats['system_efficiency_trend'].append({
                 'timestamp': time.time(),
                 'efficiency': current_efficiency
             })
             
-            # 限制趋势记录长度
             if len(self.stats['system_efficiency_trend']) > 100:
                 self.stats['system_efficiency_trend'] = self.stats['system_efficiency_trend'][-50:]
             
-            # 效率警报
             if current_efficiency < 0.6:
                 alert = {
                     'timestamp': time.time(),
@@ -1250,7 +1706,6 @@ class EnhancedVehicleScheduler:
         if progress >= 1.0:
             return path[-1]
         
-        # 简单线性插值
         total_length = self._calculate_path_length(path)
         target_distance = total_length * progress
         
@@ -1275,7 +1730,8 @@ class EnhancedVehicleScheduler:
         
         return path[-1]
     
-    # 冲突解决相关方法
+    # ==================== 外部接口 ====================
+    
     def handle_conflict_resolution_result(self, vehicle_id: str, resolution_success: bool):
         """处理冲突解决结果"""
         if vehicle_id in self.vehicle_states:
@@ -1309,7 +1765,6 @@ class EnhancedVehicleScheduler:
         """获取综合统计信息"""
         stats = self.stats.copy()
         
-        # 实时状态
         active_vehicles = len([v for v in self.vehicle_states.values() 
                              if v.status != VehicleStatus.IDLE])
         idle_vehicles = len([v for v in self.vehicle_states.values() 
@@ -1321,7 +1776,6 @@ class EnhancedVehicleScheduler:
             'total_vehicles': len(self.vehicle_states)
         }
         
-        # 效率指标
         try:
             current_efficiency = self.efficiency_optimizer.calculate_system_efficiency()
             stats['efficiency_metrics'] = {
@@ -1337,18 +1791,24 @@ class EnhancedVehicleScheduler:
                 'optimization_cycles': 0
             }
         
+        # 添加ECBS协调统计
+        coordination_stats = self.get_coordination_statistics()
+        stats['coordination'] = coordination_stats
+        
         return stats
     
     def set_backbone_network(self, backbone_network):
         """设置骨干网络"""
         self.backbone_network = backbone_network
+        self.ecbs_coordinator.backbone_network = backbone_network
     
     def get_efficiency_report(self) -> Dict:
         """获取效率报告"""
         return {
             'system_efficiency': self.efficiency_optimizer.calculate_system_efficiency(),
             'system_metrics': self.efficiency_optimizer.system_metrics,
-            'optimization_history': self.efficiency_optimizer.optimization_history[-10:]
+            'optimization_history': self.efficiency_optimizer.optimization_history[-10:],
+            'coordination_efficiency': self.get_coordination_statistics()
         }
     
     def shutdown(self):
@@ -1358,9 +1818,12 @@ class EnhancedVehicleScheduler:
             self.vehicle_states.clear()
             self.active_assignments.clear()
             self.task_priority_queue.clear()
+            self.coordination_state['active_coordinations'].clear()
+            self.coordination_state['pending_coordination_requests'].clear()
         
-        print("车辆调度器已关闭")
+        print("集成ECBS功能的车辆调度器已关闭")
 
-# 向后兼容性
+# 向后兼容性别名
 SimplifiedVehicleScheduler = EnhancedVehicleScheduler
 HybridAStarIntegratedScheduler = EnhancedVehicleScheduler
+EnhancedVehicleSchedulerWithECBS = EnhancedVehicleScheduler

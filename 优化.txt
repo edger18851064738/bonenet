@@ -1,716 +1,122 @@
-# 配套代码优化指南
+# ECBS集成分析 - 各组件扩展需求
 
-## 1. 🚗 vehicle_scheduler.py 优化
+## 1. vehicle_scheduler.py 需要添加的内容
 
-### 需要添加的支持
+### 1.1 ECBS核心组件
+- **ECBSCoordinator类**: 多车辆路径协调的核心逻辑
+- **批量任务分配**: 支持同时为多个车辆分配相关任务
+- **冲突感知调度**: 在任务分配时考虑潜在冲突
+- **协调式路径规划**: 替代单独的路径规划
 
-#### A. 车辆安全参数管理
+### 1.2 新增接口方法
 ```python
-@dataclass
-class EnhancedVehicleState:
-    # 添加车辆物理参数
-    vehicle_length: float = 6.0
-    vehicle_width: float = 3.0
-    safety_margin: float = 1.5
-    
-    # 路径稳定性追踪
-    backbone_path_stability: float = 1.0
-    last_backbone_switch_time: float = 0.0
-    backbone_switch_count: int = 0
+# 批量协调接口
+def coordinate_multiple_vehicles(vehicle_ids, task_templates)
+def batch_assign_missions(assignment_plan)
+
+# ECBS集成接口  
+def trigger_ecbs_coordination(vehicle_requests)
+def handle_coordination_result(coordinated_paths)
+
+# 冲突管理接口
+def detect_task_conflicts(vehicle_assignments)
+def resolve_assignment_conflicts(conflicts)
 ```
 
-#### B. 增强的路径注册
+### 1.3 增强统计和监控
+- **协调效率指标**: ECBS求解时间、成功率
+- **多车辆协调质量**: 整体路径质量、冲突减少率
+- **骨干网络利用优化**: 批量分配下的利用率提升
+
+## 2. traffic_manager.py 需要添加的内容
+
+### 2.1 ECBS冲突检测模块
+- **EnhancedConflictDetector类**: 支持骨干路径特有冲突类型
+- **约束生成器**: 根据冲突类型生成相应约束
+- **路径验证器**: 验证路径是否满足约束集合
+
+### 2.2 多车辆协调模块
 ```python
-def _start_enhanced_movement(self, task: EnhancedTask, vehicle_state: EnhancedVehicleState) -> bool:
-    """增强的移动开始"""
-    if not task.path:
-        return False
-    
-    # 更新状态
-    vehicle_state.status = VehicleStatus.MOVING
-    
-    # 注册到交通管理器时传递车辆参数
-    if self.traffic_manager:
-        self.traffic_manager.register_vehicle_path(
-            vehicle_state.vehicle_id, 
-            task.path, 
-            task.start_time,
-            speed=vehicle_state.speed,
-            # 新增：车辆安全参数
-            vehicle_params={
-                'length': vehicle_state.vehicle_length,
-                'width': vehicle_state.vehicle_width,
-                'safety_margin': vehicle_state.safety_margin
-            }
-        )
-    
-    # 同步到环境时包含更多信息
-    if vehicle_state.vehicle_id in self.env.vehicles:
-        env_vehicle = self.env.vehicles[vehicle_state.vehicle_id]
-        env_vehicle['status'] = 'moving'
-        env_vehicle['path'] = task.path
-        env_vehicle['path_structure'] = task.path_structure or {}
-        # 新增：安全参数
-        env_vehicle['safety_params'] = {
-            'length': vehicle_state.vehicle_length,
-            'width': vehicle_state.vehicle_width,
-            'safety_margin': vehicle_state.safety_margin
-        }
+# ECBS求解器
+class ECBSSolver:
+    def solve_with_backbone_constraints()
+    def generate_child_nodes()
+    def select_critical_conflict()
+
+# 约束管理器
+class ConstraintManager:
+    def add_constraint()
+    def validate_path_against_constraints()
+    def optimize_constraint_set()
 ```
 
-#### C. 骨干路径稳定性追踪
+### 2.3 与调度器的协调接口
+- **协调请求处理**: 接收vehicle_scheduler的协调请求
+- **解决方案执行**: 将ECBS解应用到实际路径
+- **反馈机制**: 向调度器反馈协调结果和质量指标
+
+## 3. optimized_backbone_network.py 需要添加的内容
+
+### 3.1 批量分析接口
 ```python
-def _update_backbone_path_stability(self, vehicle_id: str, new_path_structure: Dict):
-    """更新骨干路径稳定性"""
-    vehicle_state = self.vehicle_states.get(vehicle_id)
-    if not vehicle_state:
-        return
-    
-    current_backbone_id = new_path_structure.get('path_id')
-    if current_backbone_id:
-        # 检查是否切换了骨干路径
-        last_backbone_id = getattr(vehicle_state, 'last_backbone_path_id', None)
-        
-        if last_backbone_id and last_backbone_id != current_backbone_id:
-            # 记录切换
-            vehicle_state.backbone_switch_count += 1
-            vehicle_state.last_backbone_switch_time = time.time()
-            vehicle_state.backbone_path_stability = max(0.1, 
-                vehicle_state.backbone_path_stability - 0.2)
-            
-            print(f"车辆 {vehicle_id} 切换骨干路径: {last_backbone_id} -> {current_backbone_id}")
-        else:
-            # 保持稳定，提升稳定性分数
-            vehicle_state.backbone_path_stability = min(1.0,
-                vehicle_state.backbone_path_stability + 0.05)
-        
-        vehicle_state.last_backbone_path_id = current_backbone_id
+# 批量路径分析
+def analyze_multiple_paths_backbone_usage(paths_dict)
+def allocate_backbone_paths_optimally(vehicle_requests)
+
+# 容量管理
+def check_backbone_capacity_conflicts(allocations)
+def reserve_backbone_capacity(vehicle_id, path_id, time_window)
 ```
 
-## 2. 🛣️ optimized_backbone_network.py 优化
+### 3.2 ECBS支持功能
+- **路径匹配算法**: 判断路径段是否在骨干网络上
+- **容量冲突检测**: 检测多车辆使用同一骨干路径的冲突
+- **优化建议生成**: 为ECBS提供路径优化建议
 
-### 需要增强的方法
+## 4. gui.py 需要添加的内容
 
-#### A. 改进备选路径查找
-```python
-def find_alternative_backbone_paths(self, target_type: str, target_id: int, 
-                                  exclude_path_id: str = None,
-                                  min_quality: float = 0.5,
-                                  max_load_factor: float = 0.7) -> List:
-    """查找高质量、低负载的备选骨干路径"""
-    alternatives = []
-    
-    for path_id, path_data in self.bidirectional_paths.items():
-        if path_id == exclude_path_id:
-            continue
-            
-        # 检查是否连接到目标
-        if ((path_data.point_a['type'] == target_type and path_data.point_a['id'] == target_id) or
-            (path_data.point_b['type'] == target_type and path_data.point_b['id'] == target_id)):
-            
-            # 质量和负载过滤
-            if (path_data.quality >= min_quality and 
-                path_data.get_load_factor() <= max_load_factor):
-                alternatives.append(path_data)
-    
-    # 按质量和负载排序 - 质量高、负载低的优先
-    alternatives.sort(key=lambda p: (-p.quality, p.get_load_factor()))
-    
-    return alternatives
+### 4.1 ECBS控制面板
+- **协调触发按钮**: 手动触发多车辆协调
+- **ECBS参数设置**: 最大扩展次数、超时时间等
+- **协调模式选择**: 实时协调/批量协调/定期协调
+
+### 4.2 可视化增强
+- **冲突可视化**: 显示检测到的各类冲突
+- **协调过程动画**: 展示ECBS求解过程
+- **解决方案对比**: 协调前后的路径对比
+- **统计面板**: ECBS性能指标和效果评估
+
+---
+
+# 集成架构设计
+
+## 数据流设计
+```
+GUI触发协调请求
+    ↓
+VehicleScheduler.coordinate_multiple_vehicles()
+    ↓
+TrafficManager.ecbs_coordinate_paths()
+    ↓
+BackboneNetwork.allocate_backbone_paths()
+    ↓
+ECBSSolver.solve() + ConflictDetector.detect()
+    ↓
+返回协调路径到VehicleScheduler
+    ↓
+更新车辆路径和任务分配
+    ↓
+GUI更新显示协调结果
 ```
 
-#### B. 路径切换控制
-```python
-def request_backbone_path_switch(self, vehicle_id: str, current_position: Tuple,
-                                target_type: str, target_id: int,
-                                switch_reason: str = "conflict_resolution") -> Optional[Tuple]:
-    """请求骨干路径切换 - 带稳定性检查"""
-    
-    # 检查车辆切换历史
-    if vehicle_id in self.vehicle_path_assignments:
-        current_path_id = self.vehicle_path_assignments[vehicle_id]
-        current_path = self.bidirectional_paths.get(current_path_id)
-        
-        if current_path:
-            # 检查当前路径负载是否真的需要切换
-            current_load = current_path.get_load_factor()
-            if current_load < 0.6 and switch_reason == "load_balancing":
-                print(f"车辆 {vehicle_id} 当前路径负载适中，跳过切换")
-                return None
-    
-    # 查找更优的备选路径
-    alternatives = self.find_alternative_backbone_paths(
-        target_type, target_id, 
-        exclude_path_id=self.vehicle_path_assignments.get(vehicle_id),
-        min_quality=0.6,
-        max_load_factor=0.5
-    )
-    
-    if alternatives:
-        best_alternative = alternatives[0]
-        
-        # 使用备选路径重新规划
-        result = self.get_path_from_position_to_target(
-            current_position, target_type, target_id, vehicle_id,
-            preferred_backbone_id=best_alternative.path_id
-        )
-        
-        if result:
-            print(f"为车辆 {vehicle_id} 成功切换到备选骨干路径: {best_alternative.path_id}")
-            return result
-    
-    return None
-```
+## 模块间接口设计
+- **VehicleScheduler ↔ TrafficManager**: 协调请求/结果接口
+- **TrafficManager ↔ BackboneNetwork**: 路径分析/分配接口  
+- **TrafficManager ↔ PathPlanner**: 约束路径规划接口
+- **所有模块 ↔ GUI**: 状态查询/控制接口
 
-#### C. 智能接口节点选择
-```python
-def _find_optimal_interface_node_enhanced(self, current_position: Tuple, 
-                                        path_data: Any, target_type: str, target_id: int,
-                                        vehicle_params: Dict = None) -> Optional[Dict]:
-    """增强的最优接口节点选择 - 考虑车辆安全参数"""
-    
-    # 获取车辆安全参数
-    safety_margin = vehicle_params.get('safety_margin', 1.5) if vehicle_params else 1.5
-    
-    # 确定使用方向和路径
-    if path_data.point_a['type'] == target_type and path_data.point_a['id'] == target_id:
-        backbone_path = path_data.reverse_path
-        target_point = path_data.point_a['position']
-    else:
-        backbone_path = path_data.forward_path
-        target_point = path_data.point_b['position']
-    
-    best_option = None
-    min_total_cost = float('inf')
-    
-    # 动态调整接口间距 - 考虑安全距离
-    safe_spacing = max(self.config['interface_spacing'], int(safety_margin * 3))
-    
-    for i in range(0, len(backbone_path), safe_spacing):
-        interface_pos = backbone_path[i]
-        
-        # 计算到接口的距离
-        access_distance = self._calculate_distance(current_position, interface_pos)
-        
-        # 安全性检查 - 确保接口位置安全
-        if not self._is_interface_position_safe(interface_pos, vehicle_params):
-            continue
-        
-        # 计算总代价
-        remaining_backbone = backbone_path[i:]
-        backbone_distance = self._calculate_path_length(remaining_backbone)
-        
-        # 接口拥堵因子
-        interface_id = f"{path_data.path_id}_if_{i // safe_spacing}"
-        congestion_factor = self._get_interface_congestion_factor(interface_id)
-        
-        total_cost = (access_distance + backbone_distance) * congestion_factor
-        
-        if total_cost < min_total_cost:
-            min_total_cost = total_cost
-            best_option = {
-                'interface_index': i,
-                'interface_position': interface_pos,
-                'access_distance': access_distance,
-                'backbone_distance': backbone_distance,
-                'total_cost': total_cost,
-                'remaining_path': remaining_backbone,
-                'safety_score': self._calculate_position_safety_score(interface_pos, vehicle_params)
-            }
-    
-    return best_option
-
-def _is_interface_position_safe(self, position: Tuple, vehicle_params: Dict = None) -> bool:
-    """检查接口位置是否对车辆安全"""
-    if not vehicle_params:
-        return True
-    
-    x, y = position[0], position[1]
-    length = vehicle_params.get('length', 6.0)
-    width = vehicle_params.get('width', 3.0)
-    margin = vehicle_params.get('safety_margin', 1.5)
-    
-    # 检查周围区域是否有足够空间
-    check_radius = max(length, width) / 2 + margin
-    
-    # 简化的安全检查
-    for dx in range(-int(check_radius), int(check_radius) + 1):
-        for dy in range(-int(check_radius), int(check_radius) + 1):
-            check_x, check_y = int(x + dx), int(y + dy)
-            
-            if (0 <= check_x < self.env.width and 
-                0 <= check_y < self.env.height and
-                hasattr(self.env, 'grid') and
-                self.env.grid[check_x, check_y] == 1):
-                return False
-    
-    return True
-```
-
-## 3. 🗺️ path_planner.py 优化
-
-### 需要增强的规划接口
-
-#### A. 支持冲突解决上下文
-```python
-def plan_path(self, vehicle_id: str, start: Tuple, goal: Tuple,
-              use_backbone: bool = True, check_conflicts: bool = True,
-              planner_type: str = "auto", context: str = "normal",
-              return_object: bool = False, 
-              # 新增参数
-              vehicle_params: Dict = None,
-              conflict_avoidance: bool = False,
-              min_safety_clearance: float = None,
-              **kwargs) -> Optional[Union[List, Tuple[List, Dict], Any]]:
-    """
-    增强的路径规划接口
-    
-    新增参数:
-        vehicle_params: 车辆安全参数
-        conflict_avoidance: 是否进行冲突避让规划
-        min_safety_clearance: 最小安全间隔
-    """
-    
-    # 根据上下文调整规划参数
-    if context == "conflict_resolution":
-        # 冲突解决时要求更高质量
-        kwargs['quality_threshold'] = kwargs.get('quality_threshold', 0.7)
-        if conflict_avoidance:
-            kwargs['safety_bias'] = 1.5  # 增加安全性偏置
-    
-    # 设置车辆安全参数
-    if vehicle_params:
-        if 'safety_margin' in vehicle_params:
-            min_safety_clearance = vehicle_params['safety_margin']
-    
-    # 调用原有规划逻辑
-    result = self._plan_with_strategy(
-        vehicle_id, start, goal, planner_type, context, 
-        use_backbone, time.time(), 
-        vehicle_params=vehicle_params,
-        min_safety_clearance=min_safety_clearance,
-        **kwargs
-    )
-    
-    # 增强结果信息
-    if result and isinstance(result, tuple):
-        path, structure = result
-        
-        # 添加安全性评估
-        structure['safety_score'] = self._evaluate_path_safety(
-            path, vehicle_params, min_safety_clearance
-        )
-        
-        # 添加冲突风险评估
-        if self.traffic_manager:
-            structure['conflict_risk'] = self._estimate_conflict_risk(path, vehicle_id)
-        
-        result = (path, structure)
-    
-    return result
-
-def _evaluate_path_safety(self, path: List, vehicle_params: Dict = None, 
-                         min_clearance: float = None) -> float:
-    """评估路径安全性"""
-    if not path or len(path) < 2:
-        return 0.5
-    
-    safety_score = 1.0
-    clearance = min_clearance or 2.0
-    
-    # 检查路径点的安全间隔
-    for point in path:
-        x, y = point[0], point[1]
-        
-        # 检查到障碍物的距离
-        min_obstacle_distance = self._get_min_obstacle_distance(x, y)
-        
-        if min_obstacle_distance < clearance:
-            # 距离障碍物太近，降低安全分数
-            safety_penalty = (clearance - min_obstacle_distance) / clearance
-            safety_score -= safety_penalty * 0.1
-    
-    return max(0.1, min(1.0, safety_score))
-
-def _estimate_conflict_risk(self, path: List, vehicle_id: str) -> float:
-    """估算路径冲突风险"""
-    if not self.traffic_manager or not path:
-        return 0.0
-    
-    # 简化的冲突风险评估
-    risk_score = 0.0
-    
-    # 检查路径是否经过高流量区域
-    for point in path[::5]:  # 采样检查
-        # 检查该位置附近的车辆密度
-        nearby_vehicles = self._count_nearby_vehicles(point, radius=10.0)
-        
-        if nearby_vehicles > 2:
-            risk_score += 0.1
-    
-    return min(1.0, risk_score)
-```
-
-## 4. 🌍 environment.py 优化
-
-### 车辆信息增强
-
-#### A. 扩展车辆信息结构
-```python
-@dataclass
-class VehicleInfo:
-    """增强的车辆信息"""
-    vehicle_id: str
-    position: Tuple[float, float, float]
-    initial_position: Tuple[float, float, float]
-    goal: Optional[Tuple[float, float, float]] = None
-    
-    # 基本属性
-    vehicle_type: str = "dump_truck"
-    max_load: float = 100
-    current_load: float = 0
-    speed: float = 1.0
-    
-    # 新增：安全参数
-    vehicle_length: float = 6.0
-    vehicle_width: float = 3.0
-    safety_margin: float = 1.5
-    turning_radius: float = 8.0
-    
-    # 状态信息
-    status: str = 'idle'
-    path: Optional[List] = None
-    path_index: int = 0
-    progress: float = 0.0
-    
-    # 新增：安全和冲突相关
-    safety_params: Dict = None
-    last_conflict_time: float = 0.0
-    conflict_count: int = 0
-    
-    def __post_init__(self):
-        if self.color is None:
-            self.color = QColor(random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
-        
-        if self.path_structure is None:
-            self.path_structure = {}
-            
-        # 初始化安全参数
-        if self.safety_params is None:
-            self.safety_params = {
-                'length': self.vehicle_length,
-                'width': self.vehicle_width,
-                'safety_margin': self.safety_margin,
-                'turning_radius': self.turning_radius
-            }
-```
-
-#### B. 安全检查增强
-```python
-def check_collision_enhanced(self, position: Tuple[float, float, float], 
-                           vehicle_params: Dict = None,
-                           exclude_vehicle: str = None) -> bool:
-    """增强的碰撞检测 - 考虑车辆真实尺寸"""
-    try:
-        x, y, theta = float(position[0]), float(position[1]), float(position[2])
-        
-        # 获取车辆参数
-        if vehicle_params:
-            length = vehicle_params.get('length', 6.0)
-            width = vehicle_params.get('width', 3.0)
-            safety_margin = vehicle_params.get('safety_margin', 1.5)
-        else:
-            length, width, safety_margin = 6.0, 3.0, 1.5
-        
-        # 计算车辆占用的矩形区域
-        half_length = (length + safety_margin) / 2
-        half_width = (width + safety_margin) / 2
-        
-        # 车辆四个角点（考虑旋转）
-        cos_theta = math.cos(theta)
-        sin_theta = math.sin(theta)
-        
-        corners = [
-            (x + half_length * cos_theta - half_width * sin_theta,
-             y + half_length * sin_theta + half_width * cos_theta),
-            (x + half_length * cos_theta + half_width * sin_theta,
-             y + half_length * sin_theta - half_width * cos_theta),
-            (x - half_length * cos_theta + half_width * sin_theta,
-             y - half_length * sin_theta - half_width * cos_theta),
-            (x - half_length * cos_theta - half_width * sin_theta,
-             y - half_length * sin_theta + half_width * cos_theta)
-        ]
-        
-        # 检查边界
-        for corner_x, corner_y in corners:
-            if (corner_x < 0 or corner_x >= self.width or 
-                corner_y < 0 or corner_y >= self.height):
-                return True
-        
-        # 检查障碍物碰撞
-        for corner_x, corner_y in corners:
-            ix, iy = int(corner_x), int(corner_y)
-            if (0 <= ix < self.width and 0 <= iy < self.height and
-                hasattr(self, 'grid') and self.grid[ix, iy] == 1):
-                return True
-        
-        # 检查与其他车辆的碰撞
-        enhanced_safety_radius = max(length, width) + safety_margin
-        for vehicle_id, vehicle_info in self.vehicles.items():
-            if vehicle_id == exclude_vehicle:
-                continue
-            
-            other_pos = vehicle_info.position
-            distance = math.sqrt(
-                (x - other_pos[0])**2 + (y - other_pos[1])**2
-            )
-            
-            # 考虑两车的安全距离
-            other_params = vehicle_info.safety_params or {}
-            other_safety_radius = max(
-                other_params.get('length', 6.0), 
-                other_params.get('width', 3.0)
-            ) + other_params.get('safety_margin', 1.5)
-            
-            required_distance = (enhanced_safety_radius + other_safety_radius) / 2
-            
-            if distance < required_distance:
-                return True
-        
-        return False
-        
-    except Exception:
-        return True
-```
-
-## 5. 📊 111.py (GUI) 优化
-
-### 可视化增强
-
-#### A. 安全矩形显示
-```python
-class VehicleGraphicsItem(QGraphicsItemGroup):
-    """专业的车辆图形项 - 支持安全矩形显示"""
-    
-    def __init__(self, vehicle_id, vehicle_data, parent=None):
-        super().__init__(parent)
-        self.vehicle_id = vehicle_id
-        self.vehicle_data = vehicle_data
-        self.position = vehicle_data.get('position', (0, 0, 0))
-        
-        # 创建车辆组件
-        self.vehicle_body = QGraphicsPolygonItem(self)
-        self.safety_rectangle = QGraphicsRectItem(self)  # 新增：安全矩形
-        self.status_indicator = QGraphicsEllipseItem(self)
-        self.load_indicator = QGraphicsRectItem(self)
-        self.direction_line = QGraphicsLineItem(self)
-        self.efficiency_ring = QGraphicsEllipseItem(self)
-        
-        # 新增：冲突警告指示器
-        self.conflict_warning = QGraphicsEllipseItem(self)
-        self.conflict_warning.setVisible(False)
-        
-        self.setZValue(15)
-        self.update_appearance()
-        self.update_position()
-    
-    def update_appearance(self):
-        """更新车辆外观 - 包含安全矩形"""
-        status = self.vehicle_data.get('status', 'idle')
-        color = VEHICLE_STATUS_COLORS.get(status, VEHICLE_STATUS_COLORS['idle'])
-        
-        # 车辆主体
-        self.vehicle_body.setBrush(QBrush(color))
-        self.vehicle_body.setPen(QPen(color.darker(150), 1))
-        
-        # 安全矩形 - 半透明显示
-        safety_params = self.vehicle_data.get('safety_params', {})
-        if safety_params:
-            safety_color = QColor(color.red(), color.green(), color.blue(), 50)
-            self.safety_rectangle.setBrush(QBrush(safety_color))
-            self.safety_rectangle.setPen(QPen(color.lighter(120), 1, Qt.DashLine))
-        
-        # 冲突警告
-        conflict_count = self.vehicle_data.get('conflict_count', 0)
-        if conflict_count > 0:
-            self.conflict_warning.setVisible(True)
-            warning_color = QColor(255, 0, 0, 150)
-            self.conflict_warning.setBrush(QBrush(warning_color))
-            self.conflict_warning.setPen(QPen(Qt.red, 2))
-        else:
-            self.conflict_warning.setVisible(False)
-    
-    def update_position(self):
-        """更新车辆位置 - 包含安全矩形"""
-        if not self.position or len(self.position) < 3:
-            return
-        
-        x, y, theta = self.position
-        
-        # 车辆主体尺寸
-        safety_params = self.vehicle_data.get('safety_params', {})
-        length = safety_params.get('length', 6.0)
-        width = safety_params.get('width', 3.0)
-        safety_margin = safety_params.get('safety_margin', 1.5)
-        
-        # 更新安全矩形
-        safe_length = length + safety_margin
-        safe_width = width + safety_margin
-        
-        self.safety_rectangle.setRect(
-            x - safe_length/2, y - safe_width/2, 
-            safe_length, safe_width
-        )
-        
-        # 应用旋转
-        transform = QTransform()
-        transform.translate(x, y)
-        transform.rotate(math.degrees(theta))
-        self.safety_rectangle.setTransform(transform)
-        
-        # 更新冲突警告位置
-        self.conflict_warning.setRect(x - 2, y - 2, 4, 4)
-        
-        # ... 其他原有的位置更新逻辑
-```
-
-#### B. 新增统计面板
-```python
-class ConflictMonitoringWidget(QWidget):
-    """冲突监控组件"""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.traffic_manager = None
-        self.init_ui()
-    
-    def init_ui(self):
-        """初始化界面"""
-        layout = QVBoxLayout(self)
-        
-        # 标题
-        title = QLabel("冲突监控")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("""
-            QLabel {
-                font-size: 14px;
-                font-weight: bold;
-                color: rgb(229, 231, 235);
-                padding: 8px;
-                background-color: rgb(239, 68, 68);
-                border-radius: 4px;
-            }
-        """)
-        layout.addWidget(title)
-        
-        # 冲突统计
-        conflict_group = QGroupBox("冲突检测")
-        conflict_layout = QVBoxLayout()
-        
-        self.total_conflicts_label = QLabel("总冲突数: 0")
-        self.rectangle_conflicts_label = QLabel("矩形冲突: 0")
-        self.resolved_conflicts_label = QLabel("已解决: 0")
-        self.resolution_rate_label = QLabel("解决率: 0%")
-        
-        conflict_layout.addWidget(self.total_conflicts_label)
-        conflict_layout.addWidget(self.rectangle_conflicts_label)
-        conflict_layout.addWidget(self.resolved_conflicts_label)
-        conflict_layout.addWidget(self.resolution_rate_label)
-        
-        conflict_group.setLayout(conflict_layout)
-        layout.addWidget(conflict_group)
-        
-        # 策略分布
-        strategy_group = QGroupBox("策略使用分布")
-        strategy_layout = QVBoxLayout()
-        
-        self.replan_count_label = QLabel("重规划: 0")
-        self.backbone_switch_label = QLabel("骨干切换: 0")
-        self.wait_count_label = QLabel("停车等待: 0")
-        
-        strategy_layout.addWidget(self.replan_count_label)
-        strategy_layout.addWidget(self.backbone_switch_label)
-        strategy_layout.addWidget(self.wait_count_label)
-        
-        strategy_group.setLayout(strategy_layout)
-        layout.addWidget(strategy_group)
-        
-        # 骨干稳定性
-        stability_group = QGroupBox("路径稳定性")
-        stability_layout = QVBoxLayout()
-        
-        self.stability_score_bar = self._create_progress_bar("稳定性分数")
-        stability_layout.addWidget(self.stability_score_bar[0])
-        stability_layout.addWidget(self.stability_score_bar[1])
-        
-        self.switches_avoided_label = QLabel("避免切换: 0")
-        stability_layout.addWidget(self.switches_avoided_label)
-        
-        stability_group.setLayout(stability_layout)
-        layout.addWidget(stability_group)
-    
-    def update_conflict_stats(self):
-        """更新冲突统计"""
-        if not self.traffic_manager:
-            return
-        
-        stats = self.traffic_manager.get_statistics()
-        
-        # 冲突统计
-        total_conflicts = stats.get('total_conflicts', 0)
-        rectangle_conflicts = stats.get('rectangle_conflicts_detected', 0)
-        resolved_conflicts = stats.get('resolved_conflicts', 0)
-        
-        self.total_conflicts_label.setText(f"总冲突数: {total_conflicts}")
-        self.rectangle_conflicts_label.setText(f"矩形冲突: {rectangle_conflicts}")
-        self.resolved_conflicts_label.setText(f"已解决: {resolved_conflicts}")
-        
-        # 解决率
-        if total_conflicts > 0:
-            resolution_rate = (resolved_conflicts / total_conflicts) * 100
-            self.resolution_rate_label.setText(f"解决率: {resolution_rate:.1f}%")
-        
-        # 策略分布
-        strategy_dist = stats.get('strategy_distribution', {})
-        self.replan_count_label.setText(f"重规划: {strategy_dist.get('replan', 0)}")
-        self.backbone_switch_label.setText(f"骨干切换: {strategy_dist.get('backbone_switch', 0)}")
-        self.wait_count_label.setText(f"停车等待: {strategy_dist.get('wait', 0)}")
-        
-        # 稳定性分数
-        stability_score = stats.get('backbone_stability_score', 1.0)
-        self.stability_score_bar[1].setValue(int(stability_score * 100))
-        
-        # 避免的切换次数
-        resolution_stats = stats.get('resolution_strategies', {})
-        switches_avoided = resolution_stats.get('backbone_switches_avoided', 0)
-        self.switches_avoided_label.setText(f"避免切换: {switches_avoided}")
-```
-
-## 🔧 主要修改总结
-
-### 1. **车辆调度器**
-- 添加车辆安全参数管理
-- 实现骨干路径稳定性追踪
-- 增强路径注册时的信息传递
-
-### 2. **骨干网络**
-- 改进备选路径查找算法
-- 添加路径切换控制机制
-- 智能接口节点选择
-
-### 3. **路径规划器**
-- 支持冲突解决上下文
-- 增加安全性和冲突风险评估
-- 返回更丰富的路径结构信息
-
-### 4. **环境管理**
-- 扩展车辆信息结构
-- 增强碰撞检测算法
-- 添加安全参数支持
-
-### 5. **GUI界面**
-- 可视化安全矩形
-- 新增冲突监控面板
-- 显示路径稳定性指标
-
-这些修改确保了整个系统能够充分利用新的安全矩形冲突检测和优化策略，同时保持了接口的兼容性。
+## 性能优化考虑
+- **增量协调**: 只协调有冲突的车辆子集
+- **缓存机制**: 缓存常见的协调方案
+- **异步处理**: 后台执行ECBS，不阻塞界面
+- **分层求解**: 先高层分配，再底层精细化

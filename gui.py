@@ -2059,7 +2059,7 @@ class ProfessionalMineGUI(QMainWindow):
             QMessageBox.critical(self, "错误", f"任务分配失败: {str(e)}")
     
     def assign_all_vehicles(self):
-        """批量分配任务"""
+        """批量分配任务 - 修改为完整工作循环"""
         if not self.vehicle_scheduler or not self.env:
             return
         
@@ -2072,17 +2072,55 @@ class ProfessionalMineGUI(QMainWindow):
             from vehicle_scheduler import TaskPriority
             priority = getattr(TaskPriority, priority_name)
             
-            assigned_count = 0
-            for vehicle_id in self.env.vehicles.keys():
-                if self.vehicle_scheduler.assign_mission_intelligently(
-                    vehicle_id=vehicle_id, priority=priority
-                ):
-                    assigned_count += 1
+            # 获取可用的点位
+            available_points = self._get_available_points()
             
-            self.status_label.setText(f"已为 {assigned_count} 个车辆分配任务")
-            QMessageBox.information(self, "成功", 
-                f"已为 {assigned_count} 个车辆分配任务\n"
-                f"优先级: {priority_name}")
+            if not self._validate_available_points(available_points):
+                QMessageBox.warning(self, "警告", 
+                    "没有足够的空闲点位进行批量分配\n"
+                    f"需要: 装载点、卸载点、停车点\n"
+                    f"可用: 装载点{len(available_points['loading'])}个, "
+                    f"卸载点{len(available_points['unloading'])}个, "
+                    f"停车点{len(available_points['parking'])}个")
+                return
+            
+            assigned_count = 0
+            assignment_details = []
+            
+            for vehicle_id in self.env.vehicles.keys():
+                # 为每个车辆智能分配点位组合
+                point_assignment = self._assign_optimal_points(vehicle_id, available_points)
+                
+                if point_assignment:
+                    success = self.vehicle_scheduler.assign_complete_work_cycle(
+                        vehicle_id=vehicle_id,
+                        loading_point_id=point_assignment['loading'],
+                        unloading_point_id=point_assignment['unloading'],
+                        parking_point_id=point_assignment['parking'],
+                        priority=priority
+                    )
+                    
+                    if success:
+                        assigned_count += 1
+                        assignment_details.append(
+                            f"车辆{vehicle_id}: L{point_assignment['loading']} → "
+                            f"U{point_assignment['unloading']} → P{point_assignment['parking']}"
+                        )
+                        
+                        # 标记点位为已占用（避免重复分配）
+                        self._mark_points_as_assigned(point_assignment, available_points)
+            
+            self.status_label.setText(f"已为 {assigned_count} 个车辆分配完整工作循环")
+            
+            # 显示详细分配结果
+            details_text = "\n".join(assignment_details[:10])  # 最多显示10个
+            if len(assignment_details) > 10:
+                details_text += f"\n... 还有{len(assignment_details) - 10}个分配"
+            
+            QMessageBox.information(self, "批量分配成功", 
+                f"已为 {assigned_count} 个车辆分配完整工作循环\n"
+                f"优先级: {priority_name}\n\n"
+                f"分配详情:\n{details_text}")
                 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"批量任务分配失败: {str(e)}")
