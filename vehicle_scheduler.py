@@ -1166,7 +1166,24 @@ class EnhancedVehicleScheduler:
         except Exception as e:
             print(f"创建任务模板失败: {e}")
             return False
-    
+    def handle_parking_decision(self, vehicle_id: str, parking_decision: Dict):
+        """处理停车决策"""
+        if vehicle_id in self.vehicle_states:
+            vehicle_state = self.vehicle_states[vehicle_id]
+            
+            # 更新车辆状态为等待
+            vehicle_state.status = VehicleStatus.WAITING
+            
+            # 记录停车信息
+            vehicle_state.parking_info = {
+                'start_time': parking_decision.get('start_time'),
+                'duration': parking_decision.get('parking_duration', 15.0),
+                'position': parking_decision.get('parking_position'),
+                'reason': 'conflict_avoidance'
+            }
+            
+            # 同步到环境
+            self._sync_vehicle_status_to_env(vehicle_id, 'waiting')    
     def assign_mission_intelligently(self, vehicle_id: str = None, 
                                    template_id: str = "default",
                                    priority: TaskPriority = TaskPriority.NORMAL) -> bool:

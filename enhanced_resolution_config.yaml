@@ -1,0 +1,185 @@
+# enhanced_resolution_config.yaml - 两阶段冲突消解系统配置
+
+# 系统级配置
+system:
+  enable_enhanced_resolution: true
+  resolution_priority: 
+    - backbone_switching    # 优先尝试骨干路径切换
+    - parking_wait         # 其次尝试停车等待
+    - ecbs_fallback       # 最后使用ECBS
+  
+  # 性能配置
+  max_resolution_time: 5.0    # 最大消解时间（秒）
+  parallel_evaluation: true   # 并行评估多个方案
+  cache_resolution_results: true
+
+# 骨干网络配置
+backbone_network:
+  # 路径生成参数
+  generation:
+    alternatives_per_destination: 3    # 每个目的地的备选路径数
+    quality_threshold_main: 0.8       # 主路径质量阈值
+    quality_threshold_alternative: 0.6 # 备选路径质量阈值
+    path_separation_distance: 30.0    # 路径最小分离距离
+    
+  # 路径切换参数
+  switching:
+    enable_stability_management: true  # 启用稳定性管理
+    max_switches_per_vehicle: 3       # 每车最大切换次数
+    switch_cooldown_time: 300         # 切换冷却时间（秒）
+    stability_bonus_weight: 0.15      # 稳定性奖励权重
+    
+  # 接口选择参数
+  interface_selection:
+    conflict_avoidance_radius: 20.0   # 冲突避让半径
+    interface_spacing: 10.0           # 接口间距
+    safety_score_weight: 0.3          # 安全分数权重
+
+# 冲突检测配置
+conflict_detection:
+  # 检测参数
+  safety_margin: 8.0                  # 安全边距
+  prediction_horizon: 30.0            # 预测时域
+  temporal_resolution: 0.5            # 时间分辨率
+  
+  # 冲突区域参数
+  conflict_zone:
+    base_radius: 15.0                 # 基础半径
+    severity_multiplier: 1.5          # 严重程度倍数
+    merge_threshold: 25.0             # 合并阈值
+
+# 第一阶段：骨干路径切换
+phase1_backbone_switching:
+  # 候选选择
+  candidate_selection:
+    priority_threshold: 0.5           # 优先级阈值（低于此值的车辆优先切换）
+    conflict_count_weight: 0.3        # 冲突次数权重
+    
+  # 路径评估
+  path_evaluation:
+    min_switch_benefit: 0.3          # 最小切换收益
+    avoidance_score_components:
+      distance_from_conflict: 0.4     # 距离冲突区域权重
+      access_distance: 0.3            # 接入距离权重
+      path_quality: 0.3               # 路径质量权重
+    
+  # 执行参数
+  execution:
+    max_attempts: 3                   # 最大尝试次数
+    replan_timeout: 3.0              # 重规划超时时间
+
+# 第二阶段：停车等待
+phase2_parking_wait:
+  # 停车决策
+  parking_decision:
+    default_duration: 15.0            # 默认停车时长（秒）
+    adaptive_duration: true           # 自适应停车时长
+    min_duration: 10.0               # 最小停车时长
+    max_duration: 30.0               # 最大停车时长
+    
+  # 停车位置选择
+  position_selection:
+    search_radius: 20.0              # 搜索半径
+    safety_distance: 10.0            # 安全距离
+    angle_resolution: 45             # 角度分辨率（度）
+    position_evaluation:
+      safety_weight: 0.5             # 安全性权重
+      distance_weight: 0.3           # 距离权重
+      accessibility_weight: 0.2      # 可达性权重
+    
+  # 冲突预测
+  conflict_prediction:
+    enable_prediction: true          # 启用冲突预测
+    prediction_interval: 5.0         # 预测间隔
+    confidence_threshold: 0.7        # 置信度阈值
+
+# ECBS回退配置
+ecbs_fallback:
+  # ECBS参数
+  max_expansions: 500               # 最大扩展次数
+  timeout: 30.0                     # 超时时间
+  suboptimality_bound: 1.5          # 次优界限
+  
+  # 约束生成
+  constraint_generation:
+    vertex_constraint_radius: 2.0    # 顶点约束半径
+    edge_constraint_length: 5.0      # 边约束长度
+    temporal_constraint_window: 5.0  # 时间约束窗口
+
+# 自适应参数调整
+adaptive_tuning:
+  enable: true                      # 启用自适应调整
+  
+  # 学习参数
+  learning_rate: 0.1                # 学习率
+  history_window: 100               # 历史窗口大小
+  
+  # 调整策略
+  strategies:
+    - name: "high_traffic"
+      condition: "vehicle_count > 10"
+      adjustments:
+        parking_duration: 20.0
+        conflict_zone_radius: 20.0
+        min_switch_benefit: 0.4
+        
+    - name: "low_efficiency"
+      condition: "system_efficiency < 0.6"
+      adjustments:
+        enable_multi_stage: false    # 直接使用ECBS
+        max_resolution_time: 10.0
+        
+    - name: "frequent_conflicts"
+      condition: "conflict_rate > 0.3"
+      adjustments:
+        prediction_horizon: 45.0
+        safety_margin: 10.0
+        parking_duration: 25.0
+
+# 监控和日志
+monitoring:
+  # 性能监控
+  performance_metrics:
+    - resolution_time               # 消解时间
+    - success_rate                  # 成功率
+    - conflict_recurrence          # 冲突复发率
+    - vehicle_efficiency           # 车辆效率
+    
+  # 日志配置
+  logging:
+    level: "INFO"                  # 日志级别
+    log_conflicts: true            # 记录冲突
+    log_resolutions: true          # 记录消解决策
+    log_predictions: false         # 记录预测（可能产生大量日志）
+    
+  # 统计收集
+  statistics:
+    collection_interval: 60.0      # 统计收集间隔（秒）
+    export_format: "json"          # 导出格式
+    export_path: "./stats/"        # 导出路径
+
+# 可视化配置
+visualization:
+  # 冲突区域显示
+  conflict_zones:
+    show: true
+    color: [255, 0, 0]            # RGB颜色
+    opacity: 0.3                  # 透明度
+    
+  # 停车车辆显示
+  parking_vehicles:
+    show: true
+    color: [255, 165, 0]          # 橙色
+    show_timer: true              # 显示倒计时
+    
+  # 路径切换显示
+  path_switches:
+    show: true
+    color: [0, 150, 255]          # 蓝色
+    animation_duration: 2.0       # 动画时长
+    
+  # 状态面板
+  status_panel:
+    show: true
+    position: "top_right"         # 位置
+    update_interval: 1.0          # 更新间隔

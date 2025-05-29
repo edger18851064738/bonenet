@@ -1733,6 +1733,13 @@ class EnhancedProfessionalMineGUI(QMainWindow):
             self.traffic_manager = OptimizedTrafficManagerWithECBS(
                 self.env, self.backbone_network, self.path_planner
             )
+            self.traffic_manager.use_enhanced_resolution = True
+
+            # 配置参数
+            self.traffic_manager.enhanced_resolver.config.update({
+                'parking_duration': 20.0,  # 调整停车时长为20秒
+                'enable_multi_stage': True
+            })
             print("✅ 集成ECBS的交通管理器创建成功")
             
             # ★ 创建集成ECBS的车辆调度器

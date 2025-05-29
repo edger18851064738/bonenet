@@ -699,7 +699,7 @@ class OptimizedTrafficManagerWithECBS:
         
         # 线程锁
         self.state_lock = threading.RLock()
-        
+        self.init_enhanced_resolver()
         # 增强统计
         self.stats = {
             'total_conflicts': 0,
@@ -715,7 +715,19 @@ class OptimizedTrafficManagerWithECBS:
         print("初始化集成完整ECBS的优化交通管理器 (修复版)")
     
     # ==================== 新增：缺失的方法 ====================
-    
+    def init_enhanced_resolver(self):
+        """初始化增强冲突消解器"""
+        try:
+            from enhanced_conflict_resolver import EnhancedConflictResolver
+            self.enhanced_resolver = EnhancedConflictResolver(
+                self, self.backbone_network, self.path_planner
+            )
+            self.use_enhanced_resolution = True
+            print("✅ 增强冲突消解器已启用")
+        except ImportError:
+            self.enhanced_resolver = None
+            self.use_enhanced_resolution = False
+            print("⚠️ 增强冲突消解器不可用，使用默认ECBS")    
     def set_vehicle_priority(self, vehicle_id: str, priority: float) -> bool:
         """设置车辆优先级"""
         try:
@@ -969,9 +981,159 @@ class OptimizedTrafficManagerWithECBS:
         if not conflicts:
             return {vid: info['path'] for vid, info in self.active_paths.items()}
         
+        print(f"检测到 {len(conflicts)} 个冲突")
+        
+        # 尝试使用增强的两阶段冲突消解
+        if self.use_enhanced_resolution and self.enhanced_resolver:
+            try:
+                # 准备车辆状态信息
+                vehicle_states = self._prepare_vehicle_states_for_resolution()
+                
+                # 调用增强消解器
+                resolution_result = self.enhanced_resolver.resolve_conflicts(
+                    conflicts, vehicle_states
+                )
+                
+                if resolution_result.get('success'):
+                    # 应用消解结果
+                    self._apply_enhanced_resolution_result(resolution_result)
+                    
+                    # 更新统计
+                    self.stats['resolved_conflicts'] += len(conflicts)
+                    
+                    # 返回修改后的路径
+                    current_paths = {vid: info['path'] for vid, info in self.active_paths.items()}
+                    modified_paths = resolution_result.get('modified_paths', {})
+                    current_paths.update(modified_paths)
+                    
+                    print(f"✅ 增强冲突消解成功: {resolution_result.get('phase')}")
+                    return current_paths
+                    
+            except Exception as e:
+                print(f"❌ 增强冲突消解失败: {e}")
+        
+        # 回退到原有ECBS方法
+        print("使用原有ECBS冲突消解")
+        return self._original_resolve_conflicts(conflicts)
+    def _prepare_vehicle_states_for_resolution(self) -> Dict:
+        """为冲突消解准备车辆状态"""
+        vehicle_states = {}
+        
+        for vehicle_id, path_info in self.active_paths.items():
+            # 获取当前位置
+            current_position = self._get_vehicle_current_position(vehicle_id)
+            
+            # 获取目标信息
+            path = path_info.get('path', [])
+            goal = path[-1] if path else current_position
+            
+            # 构建状态信息
+            vehicle_states[vehicle_id] = {
+                'vehicle_id': vehicle_id,
+                'position': current_position,
+                'path': path,
+                'priority_level': self.get_vehicle_priority(vehicle_id),
+                'speed': path_info.get('speed', 1.0),
+                'goal': goal,
+                'status': 'moving',  # 简化处理
+                'backbone_id': self._extract_backbone_id(path_info)
+            }
+        
+        return vehicle_states
+
+    def _get_vehicle_current_position(self, vehicle_id: str) -> Tuple:
+        """获取车辆当前位置"""
+        # 从环境获取
+        if self.env and hasattr(self.env, 'vehicles'):
+            vehicle = self.env.vehicles.get(vehicle_id)
+            if vehicle:
+                if hasattr(vehicle, 'position'):
+                    return vehicle.position
+                elif isinstance(vehicle, dict) and 'position' in vehicle:
+                    return vehicle['position']
+        
+        # 从路径信息推断
+        if vehicle_id in self.active_paths:
+            path = self.active_paths[vehicle_id].get('path', [])
+            if path:
+                # 根据时间推断位置（简化处理）
+                return path[0]
+        
+        return (0, 0, 0)
+
+    def _extract_backbone_id(self, path_info: Dict) -> Optional[str]:
+        """提取骨干路径ID"""
+        # 从路径结构信息中提取
+        structure = path_info.get('structure', {})
+        return structure.get('path_id') or structure.get('backbone_id')
+
+    def _apply_enhanced_resolution_result(self, result: Dict):
+        """应用增强冲突消解结果"""
+        # 更新修改的路径
+        if 'modified_paths' in result:
+            for vehicle_id, new_path in result['modified_paths'].items():
+                if vehicle_id in self.active_paths:
+                    # 保留原有信息，只更新路径
+                    self.active_paths[vehicle_id]['path'] = new_path
+                    self.active_paths[vehicle_id]['coordination_method'] = 'enhanced_resolution'
+                    self.active_paths[vehicle_id]['resolution_phase'] = result.get('phase')
+        
+        # 处理停车决策
+        if 'parking_decisions' in result:
+            for decision in result['parking_decisions']:
+                self._handle_parking_decision(decision)
+        
+        # 处理路径切换决策
+        if 'switch_decisions' in result:
+            for switch in result['switch_decisions']:
+                self._handle_path_switch(switch)
+        
+        # 更新统计
+        phase = result.get('phase')
+        if phase == 'backbone_switching':
+            self.stats['backbone_switches'] = self.stats.get('backbone_switches', 0) + 1
+        elif phase == 'parking_wait':
+            self.stats['parking_maneuvers'] = self.stats.get('parking_maneuvers', 0) + 1
+        elif phase == 'ecbs_fallback':
+            self.stats['ecbs_coordinations'] += 1
+
+    def _handle_parking_decision(self, decision: Any):
+        """处理停车决策"""
+        vehicle_id = decision.vehicle_id
+        
+        # 记录停车信息
+        if not hasattr(self, 'parking_vehicles'):
+            self.parking_vehicles = {}
+        
+        self.parking_vehicles[vehicle_id] = {
+            'position': decision.parking_position,
+            'duration': decision.parking_duration,
+            'start_time': decision.start_time,
+            'priority_vehicle': decision.priority_vehicle_id
+        }
+        
+        print(f"车辆 {vehicle_id} 开始停车等待 {decision.parking_duration}秒")
+
+    def _handle_path_switch(self, switch: Any):
+        """处理路径切换"""
+        vehicle_id = switch.vehicle_id
+        
+        print(f"车辆 {vehicle_id} 切换骨干路径: "
+            f"{switch.original_backbone_id} -> {switch.new_backbone_id}")
+        
+        # 记录切换信息
+        if vehicle_id in self.active_paths:
+            self.active_paths[vehicle_id]['backbone_switch'] = {
+                'from': switch.original_backbone_id,
+                'to': switch.new_backbone_id,
+                'time': time.time()
+            }
+
+    def _original_resolve_conflicts(self, conflicts: List) -> Dict[str, List]:
+        """原有的ECBS冲突消解（作为备份）"""
+        # 这里是原有的resolve_conflicts实现
         print(f"检测到 {len(conflicts)} 个冲突，使用ECBS协调解决...")
         
-        # 提取冲突车辆
         involved_vehicles = set()
         for conflict in conflicts:
             if hasattr(conflict, 'agents'):
@@ -980,7 +1142,6 @@ class OptimizedTrafficManagerWithECBS:
         if len(involved_vehicles) < 2:
             return {vid: info['path'] for vid, info in self.active_paths.items()}
         
-        # 构建车辆请求 - 考虑优先级
         vehicle_requests = {}
         for vehicle_id in involved_vehicles:
             if vehicle_id in self.active_paths:
@@ -993,15 +1154,12 @@ class OptimizedTrafficManagerWithECBS:
                     'priority': priority
                 }
         
-        # 使用ECBS重新协调
         coordination_result = self.ecbs_coordinate_paths(vehicle_requests)
         
         if coordination_result.get('success', False):
-            # 使用协调后的路径
             coordinated_paths = coordination_result['paths']
             current_paths = {vid: info['path'] for vid, info in self.active_paths.items()}
             
-            # 更新冲突车辆的路径
             for vehicle_id, new_path in coordinated_paths.items():
                 current_paths[vehicle_id] = new_path
             
@@ -1031,13 +1189,23 @@ class OptimizedTrafficManagerWithECBS:
             return True
     
     def update(self, time_delta: float):
-        """更新管理器"""
-        # 定期检查是否需要协调
-        if len(self.active_paths) >= 3:
-            conflicts = self.detect_all_conflicts()
-            if len(conflicts) >= 2:
-                print(f"检测到 {len(conflicts)} 个冲突，触发ECBS协调...")
-                self.resolve_conflicts(conflicts)
+        """更新增强冲突消解状态"""
+        if hasattr(self, 'enhanced_resolver') and self.enhanced_resolver:
+            # 清理已完成的停车车辆
+            self.enhanced_resolver.clear_parking_vehicles()
+            
+            # 更新停车车辆状态
+            if hasattr(self, 'parking_vehicles'):
+                current_time = time.time()
+                completed = []
+                
+                for vehicle_id, parking_info in self.parking_vehicles.items():
+                    if current_time - parking_info['start_time'] > parking_info['duration']:
+                        completed.append(vehicle_id)
+                        print(f"车辆 {vehicle_id} 完成停车等待")
+                
+                for vehicle_id in completed:
+                    del self.parking_vehicles[vehicle_id]
     
     def set_backbone_network(self, backbone_network):
         """设置骨干网络"""
@@ -1050,26 +1218,18 @@ class OptimizedTrafficManagerWithECBS:
         self.ecbs_solver.path_planner = path_planner
     
     def get_statistics(self) -> Dict:
-        """获取统计信息"""
-        stats = self.stats.copy()
-        stats['active_vehicles'] = len(self.active_paths)
-        stats['managed_priorities'] = len(self.vehicle_priorities)
+        """获取增强统计信息"""
+        base_stats = self.get_statistics()
         
-        # ECBS特有统计
-        ecbs_stats = self.ecbs_solver.stats.copy()
-        stats['ecbs_solver_stats'] = ecbs_stats
+        # 添加增强冲突消解统计
+        if hasattr(self, 'enhanced_resolver') and self.enhanced_resolver:
+            enhanced_stats = self.enhanced_resolver.get_statistics()
+            base_stats['enhanced_resolution'] = enhanced_stats
+            
+            # 添加当前状态
+            base_stats['active_parking_vehicles'] = len(getattr(self, 'parking_vehicles', {}))
         
-        # 优先级统计
-        if self.vehicle_priorities:
-            priorities = list(self.vehicle_priorities.values())
-            stats['priority_stats'] = {
-                'average_priority': sum(priorities) / len(priorities),
-                'max_priority': max(priorities),
-                'min_priority': min(priorities),
-                'high_priority_vehicles': len([p for p in priorities if p > 0.7])
-            }
-        
-        return stats
+        return base_stats
     
     def clear_all(self):
         """清理所有数据"""
