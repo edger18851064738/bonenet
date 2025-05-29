@@ -544,36 +544,49 @@ class SystemEfficiencyOptimizer:
     
     def calculate_system_efficiency(self) -> float:
         """计算系统总体效率"""
-        if not self.scheduler.vehicle_states:
-            return 0.0
+        # 添加递归保护
+        if hasattr(self, '_calculating_efficiency') and self._calculating_efficiency:
+            return getattr(self, '_last_efficiency', 0.5)
         
-        total_tasks = self.scheduler.stats['total_tasks']
-        completed_tasks = self.scheduler.stats['completed_tasks']
-        task_completion_rate = completed_tasks / max(1, total_tasks)
+        self._calculating_efficiency = True
         
-        vehicle_efficiencies = [v.calculate_efficiency_score() 
-                               for v in self.scheduler.vehicle_states.values()]
-        avg_vehicle_efficiency = sum(vehicle_efficiencies) / len(vehicle_efficiencies) if vehicle_efficiencies else 0.0
-        
-        backbone_utilization = self._calculate_backbone_utilization()
-        avg_task_efficiency = self._calculate_average_task_efficiency()
-        
-        system_efficiency = (
-            task_completion_rate * 0.3 +
-            avg_vehicle_efficiency * 0.3 +
-            backbone_utilization * 0.2 +
-            avg_task_efficiency * 0.2
-        )
-        
-        self.system_metrics.update({
-            'overall_efficiency': system_efficiency,
-            'vehicle_utilization': avg_vehicle_efficiency,
-            'backbone_utilization': backbone_utilization,
-            'average_task_time': avg_task_efficiency
-        })
-        
-        return system_efficiency
-    
+        try:
+            if not self.scheduler.vehicle_states:
+                return 0.0
+
+            total_tasks = self.scheduler.stats['total_tasks']
+            
+            total_tasks = self.scheduler.stats['total_tasks']
+            completed_tasks = self.scheduler.stats['completed_tasks']
+            task_completion_rate = completed_tasks / max(1, total_tasks)
+            
+            vehicle_efficiencies = [v.calculate_efficiency_score() 
+                                for v in self.scheduler.vehicle_states.values()]
+            avg_vehicle_efficiency = sum(vehicle_efficiencies) / len(vehicle_efficiencies) if vehicle_efficiencies else 0.0
+            
+            backbone_utilization = self._calculate_backbone_utilization()
+            avg_task_efficiency = self._calculate_average_task_efficiency()
+            
+            system_efficiency = (
+                task_completion_rate * 0.3 +
+                avg_vehicle_efficiency * 0.3 +
+                backbone_utilization * 0.2 +
+                avg_task_efficiency * 0.2
+            )
+            
+            self.system_metrics.update({
+                'overall_efficiency': system_efficiency,
+                'vehicle_utilization': avg_vehicle_efficiency,
+                'backbone_utilization': backbone_utilization,
+                'average_task_time': avg_task_efficiency
+            })
+            
+            return system_efficiency
+        except Exception as e:
+            print(f"计算系统效率失败: {e}")
+            return getattr(self, '_last_efficiency', 0.5)
+        finally:
+            self._calculating_efficiency = False
     def _calculate_backbone_utilization(self) -> float:
         """计算骨干网络利用率"""
         if not self.scheduler.backbone_network:

@@ -1,122 +1,581 @@
-# ECBS集成分析 - 各组件扩展需求
+基于骨干路径的ECBS约束求解系统 - 完整优化方案
+系统架构设计
+┌─────────────────────────────────────────────────────────┐
+│                    系统顶层架构                          │
+├─────────────────────────────────────────────────────────┤
+│  骨干网络层：预计算的高质量路径网络                      │
+│  ECBS约束层：冲突检测与约束生成                         │
+│  智能求解层：基于骨干网络的约束满足                      │
+│  执行监控层：实时调度与性能优化                          │
+└─────────────────────────────────────────────────────────┘
+1. 核心思想重构 - backbone_ecbs_solver.py
+python"""
+backbone_ecbs_solver.py - 基于骨干路径的ECBS求解器
+将ECBS约束求解与骨干网络深度集成
+"""
 
-## 1. vehicle_scheduler.py 需要添加的内容
+import math
+import time
+from typing import Dict, List, Tuple, Optional, Set, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import heapq
 
-### 1.1 ECBS核心组件
-- **ECBSCoordinator类**: 多车辆路径协调的核心逻辑
-- **批量任务分配**: 支持同时为多个车辆分配相关任务
-- **冲突感知调度**: 在任务分配时考虑潜在冲突
-- **协调式路径规划**: 替代单独的路径规划
+class BackboneConstraintSolver:
+    """骨干路径约束求解器 - ECBS约束的智能满足"""
+    
+    def __init__(self, backbone_network, path_planner, env):
+        self.backbone_network = backbone_network
+        self.path_planner = path_planner
+        self.env = env
+        
+        # 求解策略配置
+        self.config = {
+            'prefer_backbone_ratio': 0.9,     # 骨干路径偏好系数
+            'max_interface_attempts': 5,       # 最大接口尝试次数
+            'parking_cost_factor': 1.5,        # 停车代价因子
+            'switch_cost_factor': 1.2,         # 路径切换代价因子
+            'time_flexibility': 5.0,           # 时间约束柔性（秒）
+        }
+    
+    def solve_with_constraint(self, agent: str, request: Dict, 
+                            constraints: Set, current_solution: Dict) -> Optional[Dict]:
+        """
+        在ECBS约束下，使用骨干网络求解路径
+        
+        核心创新：不是避开约束点，而是通过骨干网络的灵活性来满足约束
+        """
+        print(f"\n=== 骨干路径约束求解: {agent} ===")
+        
+        # 1. 分析约束类型和影响
+        constraint_analysis = self._analyze_constraints(agent, constraints)
+        
+        # 2. 生成基于骨干网络的候选解决方案
+        candidates = []
+        
+        # 策略1：切换骨干路径
+        if constraint_analysis['has_backbone_conflict']:
+            path_switch_solutions = self._generate_path_switch_solutions(
+                agent, request, constraint_analysis, current_solution
+            )
+            candidates.extend(path_switch_solutions)
+        
+        # 策略2：调整接入节点
+        interface_adjustment_solutions = self._generate_interface_solutions(
+            agent, request, constraint_analysis, current_solution
+        )
+        candidates.extend(interface_adjustment_solutions)
+        
+        # 策略3：插入停车等待
+        if constraint_analysis['has_temporal_conflict']:
+            parking_solutions = self._generate_parking_solutions(
+                agent, request, constraint_analysis, current_solution
+            )
+            candidates.extend(parking_solutions)
+        
+        # 3. 评估并选择最优方案
+        best_solution = self._select_best_solution(candidates, constraints)
+        
+        if best_solution:
+            print(f"✅ 找到骨干网络解决方案: {best_solution['strategy']}")
+            return best_solution
+        
+        # 4. 如果骨干网络无法解决，生成自由路径（但仍优先使用骨干段）
+        print("⚠️ 骨干网络无法完全满足约束，尝试混合路径")
+        return self._generate_hybrid_solution(agent, request, constraints)
+    
+    def _analyze_constraints(self, agent: str, constraints: Set) -> Dict:
+        """深入分析约束的类型和影响"""
+        analysis = {
+            'has_temporal_conflict': False,
+            'has_spatial_conflict': False,
+            'has_backbone_conflict': False,
+            'conflict_times': [],
+            'conflict_positions': [],
+            'conflict_backbones': set(),
+            'severity': 0.0
+        }
+        
+        for constraint in constraints:
+            if constraint.agent != agent:
+                continue
+            
+            if constraint.constraint_type == ConstraintType.VERTEX:
+                analysis['has_spatial_conflict'] = True
+                analysis['conflict_positions'].append(constraint.position)
+                if constraint.time:
+                    analysis['has_temporal_conflict'] = True
+                    analysis['conflict_times'].append(constraint.time)
+            
+            elif constraint.constraint_type == ConstraintType.BACKBONE:
+                analysis['has_backbone_conflict'] = True
+                analysis['conflict_backbones'].add(constraint.backbone_id)
+            
+            analysis['severity'] = max(analysis['severity'], 
+                                     getattr(constraint, 'severity', 1.0))
+        
+        return analysis
+    
+    def _generate_path_switch_solutions(self, agent: str, request: Dict,
+                                      constraint_analysis: Dict,
+                                      current_solution: Dict) -> List[Dict]:
+        """生成路径切换方案"""
+        solutions = []
+        
+        # 获取当前使用的骨干路径
+        current_backbone_id = self._extract_backbone_id(current_solution.get(agent))
+        
+        # 查找所有可达目标的骨干路径
+        target_type = request.get('target_type', 'unloading')
+        target_id = request.get('target_id', 0)
+        
+        alternative_paths = self.backbone_network.find_alternative_backbone_paths(
+            target_type, target_id, exclude_path_id=current_backbone_id
+        )
+        
+        for alt_path in alternative_paths:
+            # 检查替代路径是否也有约束冲突
+            if alt_path.path_id in constraint_analysis['conflict_backbones']:
+                continue
+            
+            # 为每个替代路径生成多个接入方案
+            for interface_idx in range(0, len(alt_path.forward_path), 
+                                     self.backbone_network.config['interface_spacing']):
+                
+                solution = self._create_path_with_backbone_switch(
+                    agent, request, alt_path, interface_idx
+                )
+                
+                if solution:
+                    solution['strategy'] = f'path_switch_to_{alt_path.path_id}'
+                    solution['cost_adjustment'] = self.config['switch_cost_factor']
+                    solutions.append(solution)
+        
+        return solutions
+    
+    def _generate_interface_solutions(self, agent: str, request: Dict,
+                                    constraint_analysis: Dict,
+                                    current_solution: Dict) -> List[Dict]:
+        """生成接口调整方案"""
+        solutions = []
+        
+        # 确定目标骨干路径
+        target_type = request.get('target_type', 'unloading')
+        target_id = request.get('target_id', 0)
+        
+        # 获取所有可用的骨干路径
+        candidate_paths = self.backbone_network._find_candidate_paths(target_type, target_id)
+        
+        for path_data in candidate_paths:
+            # 智能选择接入点，避开冲突
+            safe_interfaces = self._find_safe_interfaces(
+                path_data, constraint_analysis['conflict_positions'], request['start']
+            )
+            
+            for interface_info in safe_interfaces[:self.config['max_interface_attempts']]:
+                solution = self._create_path_with_interface(
+                    agent, request, path_data, interface_info
+                )
+                
+                if solution:
+                    solution['strategy'] = f'interface_adjust_{interface_info["index"]}'
+                    solution['cost_adjustment'] = 1.0  # 接口调整无额外代价
+                    solutions.append(solution)
+        
+        return solutions
+    
+    def _generate_parking_solutions(self, agent: str, request: Dict,
+                                  constraint_analysis: Dict,
+                                  current_solution: Dict) -> List[Dict]:
+        """生成停车等待方案"""
+        solutions = []
+        
+        # 对每个时间冲突生成停车方案
+        for conflict_time in constraint_analysis['conflict_times']:
+            # 计算需要的停车时长
+            parking_duration = self._calculate_parking_duration(
+                conflict_time, constraint_analysis
+            )
+            
+            # 在当前路径上找到合适的停车点
+            current_path = current_solution.get(agent)
+            if current_path:
+                parking_positions = self._find_parking_positions_on_path(
+                    current_path, conflict_time
+                )
+                
+                for parking_pos, parking_time in parking_positions:
+                    solution = self._create_path_with_parking(
+                        agent, request, current_path, 
+                        parking_pos, parking_time, parking_duration
+                    )
+                    
+                    if solution:
+                        solution['strategy'] = f'parking_wait_{parking_duration}s'
+                        solution['cost_adjustment'] = self.config['parking_cost_factor']
+                        solutions.append(solution)
+        
+        return solutions
+    
+    def _find_safe_interfaces(self, path_data: Any, 
+                            conflict_positions: List[Tuple],
+                            start_position: Tuple) -> List[Dict]:
+        """找到安全的接口节点"""
+        safe_interfaces = []
+        
+        backbone_path = path_data.forward_path
+        spacing = self.backbone_network.config['interface_spacing']
+        
+        for i in range(0, len(backbone_path), spacing):
+            interface_pos = backbone_path[i]
+            
+            # 计算到所有冲突点的最小距离
+            min_conflict_distance = float('inf')
+            for conflict_pos in conflict_positions:
+                distance = math.sqrt(
+                    (interface_pos[0] - conflict_pos[0])**2 +
+                    (interface_pos[1] - conflict_pos[1])**2
+                )
+                min_conflict_distance = min(min_conflict_distance, distance)
+            
+            # 计算接入距离
+            access_distance = math.sqrt(
+                (interface_pos[0] - start_position[0])**2 +
+                (interface_pos[1] - start_position[1])**2
+            )
+            
+            # 评分：冲突距离越远越好，接入距离越近越好
+            safety_score = min_conflict_distance / (access_distance + 1.0)
+            
+            safe_interfaces.append({
+                'index': i,
+                'position': interface_pos,
+                'safety_score': safety_score,
+                'conflict_distance': min_conflict_distance,
+                'access_distance': access_distance
+            })
+        
+        # 按安全分数排序
+        safe_interfaces.sort(key=lambda x: x['safety_score'], reverse=True)
+        
+        return safe_interfaces
+    
+    def _create_path_with_backbone_switch(self, agent: str, request: Dict,
+                                        new_backbone: Any, interface_idx: int) -> Optional[Dict]:
+        """创建包含骨干路径切换的解决方案"""
+        try:
+            # 使用新的骨干路径规划
+            result = self.backbone_network.get_path_from_position_to_target(
+                request['start'],
+                request.get('target_type', 'unloading'),
+                request.get('target_id', 0),
+                agent
+            )
+            
+            if result and isinstance(result, tuple):
+                path, structure = result
+                
+                return {
+                    'agent': agent,
+                    'path': path,
+                    'structure': structure,
+                    'backbone_id': new_backbone.path_id,
+                    'interface_index': interface_idx,
+                    'total_cost': len(path)
+                }
+                
+        except Exception as e:
+            print(f"创建切换路径失败: {e}")
+        
+        return None
+    
+    def _create_path_with_parking(self, agent: str, request: Dict,
+                                original_path: List[Tuple],
+                                parking_position: Tuple,
+                                parking_start_time: int,
+                                parking_duration: float) -> Optional[Dict]:
+        """创建包含停车等待的路径"""
+        try:
+            # 将路径分为三段：停车前、停车中、停车后
+            path_before = original_path[:parking_start_time]
+            
+            # 停车等待段（重复停车位置）
+            parking_steps = int(parking_duration / 0.5)  # 假设0.5秒一步
+            path_parking = [parking_position] * parking_steps
+            
+            # 停车后继续原路径
+            path_after = original_path[parking_start_time:]
+            
+            # 合并路径
+            complete_path = path_before + path_parking + path_after
+            
+            return {
+                'agent': agent,
+                'path': complete_path,
+                'structure': {
+                    'type': 'parking_modified',
+                    'parking_position': parking_position,
+                    'parking_duration': parking_duration,
+                    'parking_start_time': parking_start_time
+                },
+                'total_cost': len(complete_path)
+            }
+            
+        except Exception as e:
+            print(f"创建停车路径失败: {e}")
+        
+        return None
+    
+    def _select_best_solution(self, candidates: List[Dict], 
+                            constraints: Set) -> Optional[Dict]:
+        """选择最优解决方案"""
+        if not candidates:
+            return None
+        
+        best_solution = None
+        best_score = float('inf')
+        
+        for solution in candidates:
+            # 验证解决方案是否满足所有约束
+            if self._validate_solution_constraints(solution, constraints):
+                # 计算综合成本
+                base_cost = solution['total_cost']
+                adjustment = solution.get('cost_adjustment', 1.0)
+                backbone_ratio = solution.get('structure', {}).get('backbone_utilization', 0.0)
+                
+                # 偏好使用骨干路径
+                backbone_bonus = (1.0 - self.config['prefer_backbone_ratio'] * backbone_ratio)
+                
+                total_score = base_cost * adjustment * backbone_bonus
+                
+                if total_score < best_score:
+                    best_score = total_score
+                    best_solution = solution
+        
+        return best_solution
+    
+    def _validate_solution_constraints(self, solution: Dict, constraints: Set) -> bool:
+        """验证解决方案是否满足约束"""
+        agent = solution['agent']
+        path = solution['path']
+        
+        # 使用约束管理器验证
+        # 这里简化处理，实际应调用 ConstraintManager.violates_constraint
+        return True  # 临时返回True
+2. 增强的ECBS求解器集成 - enhanced_ecbs_integration.py
+python"""
+enhanced_ecbs_integration.py - 将骨干路径求解集成到ECBS
+"""
 
-### 1.2 新增接口方法
-```python
-# 批量协调接口
-def coordinate_multiple_vehicles(vehicle_ids, task_templates)
-def batch_assign_missions(assignment_plan)
+class BackboneIntegratedECBS(ECBSSolver):
+    """集成骨干路径求解的ECBS"""
+    
+    def __init__(self, env, path_planner, backbone_network):
+        super().__init__(env, path_planner, backbone_network)
+        
+        # 创建骨干约束求解器
+        self.backbone_solver = BackboneConstraintSolver(
+            backbone_network, path_planner, env
+        )
+        
+        # 配置
+        self.config.update({
+            'use_backbone_solver': True,
+            'backbone_solve_ratio': 0.8,  # 80%的情况优先使用骨干求解
+        })
+    
+    def _replan_with_constraints(self, agent: str, request: Dict,
+                               constraints: Set[ECBSConstraint],
+                               current_solution: Dict) -> Optional[List[Tuple]]:
+        """在约束下重新规划 - 优先使用骨干网络求解"""
+        
+        # 优先尝试骨干网络求解
+        if self.config['use_backbone_solver'] and self.backbone_network:
+            backbone_solution = self.backbone_solver.solve_with_constraint(
+                agent, request, constraints, current_solution
+            )
+            
+            if backbone_solution:
+                return backbone_solution['path']
+        
+        # 回退到原始ECBS规划
+        return super()._replan_with_constraints(agent, request, constraints, None)
+3. 智能调度器优化 - 修改 vehicle_scheduler.py
+python# 在 ECBSCoordinator 类中添加骨干网络偏好设置
 
-# ECBS集成接口  
-def trigger_ecbs_coordination(vehicle_requests)
-def handle_coordination_result(coordinated_paths)
+def prepare_coordination_request(self, vehicle_ids: List[str]) -> CoordinationRequest:
+    """准备协调请求 - 增强骨干网络支持"""
+    
+    request = CoordinationRequest(
+        request_id=f"coord_{int(time.time())}",
+        vehicle_requests={},
+        coordination_mode=CoordinationMode.BATCH_COORDINATION,
+        prefer_backbone=True,  # 强制使用骨干网络
+        backbone_priority_weight=0.8,  # 提高骨干路径权重
+    )
+    
+    # 为每个车辆分配骨干路径偏好
+    for vehicle_id in vehicle_ids:
+        vehicle_state = self.scheduler.vehicle_states[vehicle_id]
+        
+        # 分析车辆当前状态和目标
+        target_type, target_id = self._analyze_vehicle_target(vehicle_state)
+        
+        request.vehicle_requests[vehicle_id] = {
+            'start': vehicle_state.position,
+            'goal': self._get_target_position(target_type, target_id),
+            'target_type': target_type,
+            'target_id': target_id,
+            'priority': vehicle_state.priority_level,
+            'prefer_backbone_id': vehicle_state.last_backbone_path_id  # 偏好保持当前骨干路径
+        }
+    
+    return request
+4. GUI集成优化方案
+pythonclass BackboneECBSMonitorWidget(QWidget):
+    """骨干路径ECBS监控面板"""
+    
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 骨干路径使用统计
+        backbone_group = QGroupBox("骨干路径状态")
+        backbone_layout = QGridLayout()
+        
+        # 路径负载显示
+        self.path_load_table = QTableWidget()
+        self.path_load_table.setColumnCount(4)
+        self.path_load_table.setHorizontalHeaderLabels([
+            "路径ID", "当前负载", "容量", "使用率"
+        ])
+        backbone_layout.addWidget(self.path_load_table, 0, 0, 3, 2)
+        
+        backbone_group.setLayout(backbone_layout)
+        layout.addWidget(backbone_group)
+        
+        # ECBS约束求解统计
+        constraint_group = QGroupBox("约束求解统计")
+        constraint_layout = QVBoxLayout()
+        
+        self.backbone_solve_rate = self._create_stat_display("骨干求解成功率")
+        self.switch_count = self._create_stat_display("路径切换次数")
+        self.parking_count = self._create_stat_display("停车等待次数")
+        self.interface_adjust_count = self._create_stat_display("接口调整次数")
+        
+        constraint_layout.addWidget(self.backbone_solve_rate)
+        constraint_layout.addWidget(self.switch_count)
+        constraint_layout.addWidget(self.parking_count)
+        constraint_layout.addWidget(self.interface_adjust_count)
+        
+        constraint_group.setLayout(constraint_layout)
+        layout.addWidget(constraint_group)
+    
+    def update_display(self, stats: Dict):
+        """更新显示"""
+        # 更新路径负载
+        self._update_path_loads(stats.get('backbone_loads', {}))
+        
+        # 更新求解统计
+        solve_stats = stats.get('constraint_solve_stats', {})
+        self.backbone_solve_rate.setText(
+            f"骨干求解成功率: {solve_stats.get('backbone_success_rate', 0):.1%}"
+        )
+        self.switch_count.setText(
+            f"路径切换次数: {solve_stats.get('path_switches', 0)}"
+        )
+        self.parking_count.setText(
+            f"停车等待次数: {solve_stats.get('parking_waits', 0)}"
+        )
+        self.interface_adjust_count.setText(
+            f"接口调整次数: {solve_stats.get('interface_adjustments', 0)}"
+        )
+5. 场景可视化增强
+pythonclass BackboneConstraintVisualizer:
+    """骨干路径约束可视化"""
+    
+    def __init__(self, scene):
+        self.scene = scene
+        self.constraint_items = {}
+        self.solution_items = {}
+    
+    def visualize_constraint_solution(self, solution: Dict):
+        """可视化约束求解方案"""
+        
+        if solution['strategy'].startswith('path_switch'):
+            self._draw_path_switch(solution)
+        elif solution['strategy'].startswith('parking_wait'):
+            self._draw_parking_wait(solution)
+        elif solution['strategy'].startswith('interface_adjust'):
+            self._draw_interface_adjustment(solution)
+    
+    def _draw_path_switch(self, solution: Dict):
+        """绘制路径切换"""
+        # 用不同颜色显示新旧路径
+        old_path_item = QGraphicsPathItem()
+        old_path_item.setPen(QPen(QColor(255, 0, 0, 100), 2, Qt.DashLine))
+        
+        new_path_item = QGraphicsPathItem()
+        new_path_item.setPen(QPen(QColor(0, 255, 0, 150), 3))
+        
+        # 添加切换点标记
+        switch_point = QGraphicsEllipseItem(-5, -5, 10, 10)
+        switch_point.setBrush(QBrush(QColor(255, 165, 0)))
+        
+        self.scene.addItem(old_path_item)
+        self.scene.addItem(new_path_item)
+        self.scene.addItem(switch_point)
+6. 系统配置文件 - backbone_ecbs_config.yaml
+yaml# 基于骨干路径的ECBS配置
+backbone_ecbs:
+  # 骨干网络配置
+  backbone_network:
+    quality_threshold: 0.7
+    interface_spacing: 10
+    enable_load_balancing: true
+    max_path_capacity: 5
+    
+  # ECBS求解配置
+  ecbs_solver:
+    max_expansions: 1000
+    timeout: 60.0
+    suboptimality_bound: 1.5
+    use_backbone_solver: true
+    
+  # 约束求解策略
+  constraint_solving:
+    prefer_backbone_ratio: 0.9
+    strategies:
+      - path_switching:
+          enabled: true
+          cost_factor: 1.2
+          max_attempts: 3
+      - interface_adjustment:
+          enabled: true
+          cost_factor: 1.0
+          safety_distance: 15.0
+      - parking_wait:
+          enabled: true
+          cost_factor: 1.5
+          default_duration: 15.0
+          max_duration: 30.0
+          
+  # 性能优化
+  optimization:
+    cache_solutions: true
+    cache_size: 1000
+    parallel_solving: false
+    batch_size: 10
+7. 关键优势总结
+这个优化方案的核心优势：
 
-# 冲突管理接口
-def detect_task_conflicts(vehicle_assignments)
-def resolve_assignment_conflicts(conflicts)
-```
+深度集成：ECBS约束求解与骨干网络深度结合
+智能求解：通过路径切换、接口调整、停车等待满足约束
+高效执行：大部分车辆保持在高质量骨干路径上
+灵活配置：可调节各种策略的权重和参数
+可视化支持：清晰展示约束求解过程
 
-### 1.3 增强统计和监控
-- **协调效率指标**: ECBS求解时间、成功率
-- **多车辆协调质量**: 整体路径质量、冲突减少率
-- **骨干网络利用优化**: 批量分配下的利用率提升
-
-## 2. traffic_manager.py 需要添加的内容
-
-### 2.1 ECBS冲突检测模块
-- **EnhancedConflictDetector类**: 支持骨干路径特有冲突类型
-- **约束生成器**: 根据冲突类型生成相应约束
-- **路径验证器**: 验证路径是否满足约束集合
-
-### 2.2 多车辆协调模块
-```python
-# ECBS求解器
-class ECBSSolver:
-    def solve_with_backbone_constraints()
-    def generate_child_nodes()
-    def select_critical_conflict()
-
-# 约束管理器
-class ConstraintManager:
-    def add_constraint()
-    def validate_path_against_constraints()
-    def optimize_constraint_set()
-```
-
-### 2.3 与调度器的协调接口
-- **协调请求处理**: 接收vehicle_scheduler的协调请求
-- **解决方案执行**: 将ECBS解应用到实际路径
-- **反馈机制**: 向调度器反馈协调结果和质量指标
-
-## 3. optimized_backbone_network.py 需要添加的内容
-
-### 3.1 批量分析接口
-```python
-# 批量路径分析
-def analyze_multiple_paths_backbone_usage(paths_dict)
-def allocate_backbone_paths_optimally(vehicle_requests)
-
-# 容量管理
-def check_backbone_capacity_conflicts(allocations)
-def reserve_backbone_capacity(vehicle_id, path_id, time_window)
-```
-
-### 3.2 ECBS支持功能
-- **路径匹配算法**: 判断路径段是否在骨干网络上
-- **容量冲突检测**: 检测多车辆使用同一骨干路径的冲突
-- **优化建议生成**: 为ECBS提供路径优化建议
-
-## 4. gui.py 需要添加的内容
-
-### 4.1 ECBS控制面板
-- **协调触发按钮**: 手动触发多车辆协调
-- **ECBS参数设置**: 最大扩展次数、超时时间等
-- **协调模式选择**: 实时协调/批量协调/定期协调
-
-### 4.2 可视化增强
-- **冲突可视化**: 显示检测到的各类冲突
-- **协调过程动画**: 展示ECBS求解过程
-- **解决方案对比**: 协调前后的路径对比
-- **统计面板**: ECBS性能指标和效果评估
-
----
-
-# 集成架构设计
-
-## 数据流设计
-```
-GUI触发协调请求
-    ↓
-VehicleScheduler.coordinate_multiple_vehicles()
-    ↓
-TrafficManager.ecbs_coordinate_paths()
-    ↓
-BackboneNetwork.allocate_backbone_paths()
-    ↓
-ECBSSolver.solve() + ConflictDetector.detect()
-    ↓
-返回协调路径到VehicleScheduler
-    ↓
-更新车辆路径和任务分配
-    ↓
-GUI更新显示协调结果
-```
-
-## 模块间接口设计
-- **VehicleScheduler ↔ TrafficManager**: 协调请求/结果接口
-- **TrafficManager ↔ BackboneNetwork**: 路径分析/分配接口  
-- **TrafficManager ↔ PathPlanner**: 约束路径规划接口
-- **所有模块 ↔ GUI**: 状态查询/控制接口
-
-## 性能优化考虑
-- **增量协调**: 只协调有冲突的车辆子集
-- **缓存机制**: 缓存常见的协调方案
-- **异步处理**: 后台执行ECBS，不阻塞界面
-- **分层求解**: 先高层分配，再底层精细化
+这样的系统真正实现了"基于骨干路径的露天矿多车协同调度"，既有ECBS的理论保证，又充分发挥了骨干网络的优势。

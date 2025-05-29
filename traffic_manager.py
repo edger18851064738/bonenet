@@ -1219,7 +1219,8 @@ class OptimizedTrafficManagerWithECBS:
     
     def get_statistics(self) -> Dict:
         """获取增强统计信息"""
-        base_stats = self.get_statistics()
+        # 修正：使用 self.stats 而不是递归调用
+        base_stats = self.stats.copy()  # ✅ 正确的做法
         
         # 添加增强冲突消解统计
         if hasattr(self, 'enhanced_resolver') and self.enhanced_resolver:
