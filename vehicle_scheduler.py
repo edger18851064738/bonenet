@@ -11,7 +11,7 @@ from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 import heapq
-
+import random
 class TaskStatus(Enum):
     PENDING = "pending"
     ASSIGNED = "assigned"
@@ -1100,19 +1100,28 @@ class EnhancedVehicleScheduler:
         print(f"初始化了 {len(self.vehicle_states)} 个车辆状态")
     
     def create_enhanced_mission_template(self, template_id: str, 
-                                       loading_point_id: int = None, 
-                                       unloading_point_id: int = None,
-                                       priority: TaskPriority = TaskPriority.NORMAL) -> bool:
-        """创建增强任务模板"""
+                                    loading_point_id: int = None, 
+                                    unloading_point_id: int = None,
+                                    priority: TaskPriority = TaskPriority.NORMAL,
+                                    randomize: bool = True) -> bool:
+        """创建增强任务模板 - 支持随机化"""
         try:
             if not self.env.loading_points or not self.env.unloading_points:
                 print("缺少装载点或卸载点")
                 return False
             
-            if loading_point_id is None:
-                loading_point_id = 0
-            if unloading_point_id is None:
-                unloading_point_id = 0
+            # 随机选择装载点和卸载点
+            if randomize:
+                if loading_point_id is None:
+                    loading_point_id = random.randint(0, len(self.env.loading_points) - 1)
+                if unloading_point_id is None:
+                    unloading_point_id = random.randint(0, len(self.env.unloading_points) - 1)
+            else:
+                # 非随机模式，使用默认值
+                if loading_point_id is None:
+                    loading_point_id = 0
+                if unloading_point_id is None:
+                    unloading_point_id = 0
             
             if (loading_point_id >= len(self.env.loading_points) or 
                 unloading_point_id >= len(self.env.unloading_points)):
@@ -1327,51 +1336,137 @@ class EnhancedVehicleScheduler:
         try:
             task.planning_attempts += 1
             
+            # 根据任务优先级选择上下文
             context = "navigation"
             if task.priority in [TaskPriority.URGENT, TaskPriority.CRITICAL]:
                 context = "emergency"
             elif task.priority == TaskPriority.HIGH:
-                context = "backbone"
+                context = "navigation"  # 注意：不要用"backbone"避免循环
             
+            # 获取车辆安全参数
             vehicle_params = vehicle_state.get_safety_params()
             
+            # ===== 解析任务的目标类型和ID =====
+            target_type = None
+            target_id = None
+            
+            # 根据任务类型推断目标信息
+            if task.task_type in ['to_loading', 'loading']:
+                target_type = 'loading'
+                # 从目标坐标匹配装载点ID
+                if self.env and self.env.loading_points:
+                    for i, point in enumerate(self.env.loading_points):
+                        if self._is_same_position(task.goal, point):
+                            target_id = i
+                            print(f"  任务 {task.task_id}: 目标是装载点 {i}")
+                            break
+                        
+            elif task.task_type in ['to_unloading', 'unloading']:
+                target_type = 'unloading'
+                # 从目标坐标匹配卸载点ID
+                if self.env and self.env.unloading_points:
+                    for i, point in enumerate(self.env.unloading_points):
+                        if self._is_same_position(task.goal, point):
+                            target_id = i
+                            print(f"  任务 {task.task_id}: 目标是卸载点 {i}")
+                            break
+                            
+            elif task.task_type in ['to_parking', 'parking', 'to_initial']:
+                target_type = 'parking'
+                # 从目标坐标匹配停车点ID
+                if self.env and hasattr(self.env, 'parking_areas'):
+                    for i, point in enumerate(self.env.parking_areas):
+                        if self._is_same_position(task.goal, point):
+                            target_id = i
+                            print(f"  任务 {task.task_id}: 目标是停车点 {i}")
+                            break
+            
+            # 如果没有匹配到具体点，打印警告
+            if target_type and target_id is None:
+                print(f"  ⚠️ 任务 {task.task_id}: 无法匹配目标点ID，目标位置={task.goal}")
+            
+            print(f"规划任务 {task.task_id}: {vehicle_state.vehicle_id} "
+                f"从 {task.start} 到 {task.goal} "
+                f"(类型={task.task_type}, 目标={target_type}_{target_id if target_id is not None else '?'})")
+            
+            # ===== 调用路径规划器 =====
             result = self.path_planner.plan_path(
                 vehicle_state.vehicle_id,
                 task.start,
                 task.goal,
-                use_backbone=True,
+                use_backbone=True,  # 启用骨干网络
                 context=context,
-                vehicle_params=vehicle_params
+                vehicle_params=vehicle_params,
+                target_type=target_type,    # 传递目标类型
+                target_id=target_id,        # 传递目标ID
+                check_conflicts=True,
+                return_object=False  # 返回(path, structure)格式
             )
             
             if result:
-                if isinstance(result, tuple):
-                    task.path, task.path_structure = result
+                # 处理返回结果
+                if isinstance(result, tuple) and len(result) >= 2:
+                    task.path, task.path_structure = result[0], result[1]
                 else:
                     task.path = result
                     task.path_structure = {'type': 'direct'}
                 
+                # 更新任务的骨干利用率信息
                 if task.path_structure:
                     task.backbone_utilization = task.path_structure.get('backbone_utilization', 0.0)
+                    
+                    # 更新车辆的骨干使用率统计
                     vehicle_state.backbone_usage_ratio = (
                         vehicle_state.backbone_usage_ratio * 0.8 + 
                         task.backbone_utilization * 0.2
                     )
+                    
+                    # 记录骨干路径ID（如果有）
+                    backbone_path_id = task.path_structure.get('path_id')
+                    if backbone_path_id:
+                        vehicle_state.update_backbone_stability(backbone_path_id)
+                    
+                    print(f"  路径规划成功: 类型={task.path_structure.get('type', 'unknown')}, "
+                        f"长度={len(task.path)}, "
+                        f"骨干利用率={task.backbone_utilization:.2%}")
                 
+                # 在交通管理器中注册路径
                 if self.traffic_manager:
                     self.traffic_manager.register_vehicle_path(
                         vehicle_state.vehicle_id, task.path, task.start_time
                     )
                 
+                # 开始移动
                 return self._start_enhanced_movement(task, vehicle_state)
-            
+            else:
+                print(f"  ❌ 路径规划失败")
+                
         except Exception as e:
-            print(f"任务 {task.task_id} 规划失败: {e}")
+            print(f"任务 {task.task_id} 规划异常: {e}")
+            import traceback
+            traceback.print_exc()
         
+        # 规划失败处理
         task.status = TaskStatus.FAILED
         vehicle_state.status = VehicleStatus.IDLE
+        vehicle_state.current_task = None
         self.stats['failed_tasks'] += 1
+        
+        # 同步状态到环境
+        self._sync_vehicle_status_to_env(vehicle_state.vehicle_id, 'idle')
+        
         return False
+
+    def _is_same_position(self, pos1: Tuple, pos2: Tuple, tolerance: float = 2.0) -> bool:
+        """判断两个位置是否相同（辅助方法）"""
+        if not pos1 or not pos2:
+            return False
+        
+        # 只比较x,y坐标
+        dx = abs(pos1[0] - pos2[0])
+        dy = abs(pos1[1] - pos2[1])
+        
+        return dx < tolerance and dy < tolerance
     
     def _start_enhanced_movement(self, task: EnhancedTask, 
                                vehicle_state: EnhancedVehicleState) -> bool:

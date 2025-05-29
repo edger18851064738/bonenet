@@ -469,14 +469,14 @@ class EnhancedPathPlanner:
         print("路径规划器已更新交通管理器引用")
     
     def plan_path(self, vehicle_id: str, start: Tuple, goal: Tuple,
-                  use_backbone: bool = True, check_conflicts: bool = True,
-                  planner_type: str = "auto", context: str = "normal",
-                  return_object: bool = False, 
-                  # 新增参数
-                  vehicle_params: Dict = None,
-                  conflict_avoidance: bool = False,
-                  min_safety_clearance: float = None,
-                  **kwargs) -> Optional[Union[List, Tuple[List, Dict], Any]]:
+                use_backbone: bool = True, check_conflicts: bool = True,
+                planner_type: str = "auto", context: str = "normal",
+                return_object: bool = False, 
+                # 新增参数
+                vehicle_params: Dict = None,
+                conflict_avoidance: bool = False,
+                min_safety_clearance: float = None,
+                **kwargs) -> Optional[Union[List, Tuple[List, Dict], Any]]:
         """
         增强的路径规划接口
         
@@ -513,15 +513,47 @@ class EnhancedPathPlanner:
         
         # 输入验证
         if not self._validate_inputs(start, goal):
+            print(f"输入验证失败: start={start}, goal={goal}")
             return None
         
-        # 检查缓存
+        # ===== 新增：骨干网络优先逻辑 =====
+        # 注意：避免在生成骨干路径时递归调用
+        if (use_backbone and self.backbone_network and 
+            context != 'backbone' and context != 'backbone_generation'):
+            
+            print(f"路径规划: {vehicle_id} - 尝试使用骨干网络")
+            
+            # 尝试使用骨干网络
+            backbone_result = self._try_backbone_network_first(
+                vehicle_id, start, goal, vehicle_safety_params, **kwargs
+            )
+            
+            if backbone_result:
+                # 缓存结果
+                cache_key = self._generate_enhanced_cache_key(
+                    start, goal, planning_context, vehicle_params, conflict_avoidance
+                )
+                self._add_to_cache(cache_key, backbone_result)
+                
+                self.stats['successful_plans'] += 1
+                self._update_planning_stats(backbone_result, planning_start)
+                
+                print(f"✅ 车辆 {vehicle_id} 使用骨干网络路径成功: "
+                    f"长度={len(backbone_result.path)}, "
+                    f"骨干利用率={backbone_result.backbone_utilization:.2%}")
+                
+                return self._format_result(backbone_result, return_object)
+            else:
+                print(f"  骨干网络无法提供路径，切换到直接规划")
+        
+        # ===== 原有逻辑：检查缓存 =====
         cache_key = self._generate_enhanced_cache_key(
             start, goal, planning_context, vehicle_params, conflict_avoidance
         )
         cached_result = self._check_cache(cache_key)
         if cached_result:
             self.stats['cache_hits'] += 1
+            print(f"使用缓存路径: {vehicle_id}")
             return self._format_result(cached_result, return_object)
         
         print(f"开始增强路径规划: {vehicle_id} ({planning_context.value})")
@@ -541,7 +573,9 @@ class EnhancedPathPlanner:
             self._update_planning_stats(result, planning_start)
             
             print(f"✅ 路径规划成功: 质量={result.quality_score:.2f}, "
-                  f"安全={result.safety_score:.2f}, 风险={result.conflict_risk:.2f}")
+                f"安全={result.safety_score:.2f}, 风险={result.conflict_risk:.2f}")
+        else:
+            print(f"❌ 路径规划失败: {vehicle_id}")
         
         return self._format_result(result, return_object)
     
@@ -626,7 +660,69 @@ class EnhancedPathPlanner:
         
         print("  ❌ 所有回退策略均失败")
         return None
-    
+    def _try_backbone_network_first(self, vehicle_id: str, start: Tuple, goal: Tuple,
+                                vehicle_params: VehicleSafetyParams, **kwargs) -> Optional[PlanningResult]:
+        """优先尝试使用骨干网络"""
+        try:
+            # 从kwargs或环境中解析目标信息
+            target_type = kwargs.get('target_type')
+            target_id = kwargs.get('target_id')
+            
+            if not target_type or target_id is None:
+                target_type, target_id = self._infer_target_from_goal(goal)
+            
+            if not target_type:
+                return None
+            
+            print(f"  尝试骨干网络: {start} -> {target_type}_{target_id}")
+            
+            # 调用骨干网络
+            backbone_result = self.backbone_network.get_path_from_position_to_target(
+                start, target_type, target_id, vehicle_id
+            )
+            
+            if backbone_result:
+                if isinstance(backbone_result, tuple):
+                    path, structure = backbone_result
+                else:
+                    path = backbone_result
+                    structure = {'type': 'backbone_direct'}
+                
+                # 创建标准化的PlanningResult
+                return self._create_enhanced_result(
+                    path, 'backbone_network', vehicle_params, 
+                    PlanningContext.NORMAL, start, goal
+                )
+        
+        except Exception as e:
+            print(f"  骨干网络尝试失败: {e}")
+        
+        return None
+
+    def _infer_target_from_goal(self, goal: Tuple) -> Tuple[Optional[str], Optional[int]]:
+        """从目标坐标推断目标类型和ID"""
+        if not self.env:
+            return None, None
+        
+        tolerance = 2.0  # 位置匹配容差
+        
+        # 检查卸载点
+        for i, point in enumerate(self.env.unloading_points):
+            if self._calculate_distance(goal, point) < tolerance:
+                return 'unloading', i
+        
+        # 检查装载点
+        for i, point in enumerate(self.env.loading_points):
+            if self._calculate_distance(goal, point) < tolerance:
+                return 'loading', i
+        
+        # 检查停车点
+        if hasattr(self.env, 'parking_areas'):
+            for i, point in enumerate(self.env.parking_areas):
+                if self._calculate_distance(goal, point) < tolerance:
+                    return 'parking', i
+        
+        return None, None    
     def _execute_planning_strategy(self, vehicle_id: str, start: Tuple, goal: Tuple,
                                  planner_type: str, quality_level: QualityLevel,
                                  max_time: float, context: PlanningContext,

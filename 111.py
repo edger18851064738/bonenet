@@ -896,7 +896,7 @@ class EnhancedVehicleManagementWidget(QWidget):
         self.vehicle_table.setHorizontalHeaderLabels(["属性", "值", "状态", "进度"])
         self.vehicle_table.setAlternatingRowColors(True)
         self.vehicle_table.verticalHeader().setVisible(False)
-        
+
         layout.addWidget(self.vehicle_table)
         
         # 任务控制
@@ -2045,11 +2045,10 @@ class EnhancedProfessionalMineGUI(QMainWindow):
             QMessageBox.critical(self, "错误", f"任务分配失败: {str(e)}")
     
     def assign_all_vehicles(self):
-        """批量分配任务"""
+        """批量分配任务 - 随机分配到不同的装载/卸载点"""
         if not self.vehicle_scheduler or not self.env:
             return
         
-        # 获取优先级
         priority_map = {0: "LOW", 1: "NORMAL", 2: "HIGH", 3: "URGENT", 4: "CRITICAL"}
         priority_index = self.control_panel.priority_combo.currentIndex()
         priority_name = priority_map[priority_index]
@@ -2061,17 +2060,33 @@ class EnhancedProfessionalMineGUI(QMainWindow):
             assigned_count = 0
             
             for vehicle_id in self.env.vehicles.keys():
-                success = self.vehicle_scheduler.assign_mission_intelligently(
-                    vehicle_id=vehicle_id, priority=priority
-                )
-                if success:
-                    assigned_count += 1
+                # 为每个车辆创建随机的任务模板
+                template_id = f"random_mission_{vehicle_id}_{int(time.time())}"
+                
+                # 创建随机任务模板
+                if self.vehicle_scheduler.create_enhanced_mission_template(
+                    template_id, 
+                    loading_point_id=None,  # None表示随机
+                    unloading_point_id=None,  # None表示随机
+                    priority=priority,
+                    randomize=True
+                ):
+                    # 分配任务
+                    success = self.vehicle_scheduler.assign_mission_intelligently(
+                        vehicle_id=vehicle_id, 
+                        template_id=template_id,
+                        priority=priority
+                    )
+                    
+                    if success:
+                        assigned_count += 1
             
-            self.status_label.setText(f"已为 {assigned_count} 个车辆分配任务")
+            self.status_label.setText(f"已为 {assigned_count} 个车辆分配随机任务")
             
             QMessageBox.information(self, "批量分配成功", 
                 f"已为 {assigned_count} 个车辆分配任务\n"
-                f"优先级: {priority_name}")
+                f"优先级: {priority_name}\n"
+                f"任务分配: 随机")
                 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"批量任务分配失败: {str(e)}")

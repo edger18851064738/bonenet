@@ -294,14 +294,51 @@ class EnhancedPathPlannerWithConfig:
             print("⚠️ RRT规划器不可用")
     
     def plan_path(self, vehicle_id: str, start: tuple, goal: tuple,
-                  use_backbone: bool = True, check_conflicts: bool = True,
-                  planner_type: str = "auto", context: str = "normal",
-                  return_object: bool = False, **kwargs) -> Any:
+                use_backbone: bool = True, check_conflicts: bool = True,
+                planner_type: str = "auto", context: str = "normal",
+                return_object: bool = False, **kwargs) -> Any:
         """
         标准路径规划接口（向后兼容）
         内部使用渐进式回退策略
         """
-        # 调用增强的渐进式回退方法
+        
+        # ===== 新增：骨干网络优先逻辑 =====
+        if use_backbone and self.backbone_network and context != 'backbone':
+            print(f"[EnhancedPathPlannerWithConfig] 尝试使用骨干网络: {vehicle_id}")
+            
+            # 尝试从kwargs或推断目标信息
+            target_type = kwargs.get('target_type')
+            target_id = kwargs.get('target_id')
+            
+            if target_type and target_id is not None:
+                try:
+                    backbone_result = self.backbone_network.get_path_from_position_to_target(
+                        start, target_type, target_id, vehicle_id
+                    )
+                    
+                    if backbone_result:
+                        print(f"  ✅ 骨干网络路径成功!")
+                        
+                        # 处理返回结果
+                        if isinstance(backbone_result, tuple) and len(backbone_result) >= 2:
+                            path, structure = backbone_result
+                            
+                            # 创建兼容的结果对象
+                            result = self._create_result_object(
+                                path, 'backbone_network', len(path)
+                            )
+                            result.structure = structure
+                            
+                            if return_object:
+                                return result
+                            else:
+                                return path
+                        else:
+                            return backbone_result
+                except Exception as e:
+                    print(f"  骨干网络尝试失败: {e}")
+        
+        # ===== 原有逻辑：渐进式回退 =====
         result = self.plan_path_with_progressive_fallback(
             vehicle_id, start, goal, context, **kwargs
         )
