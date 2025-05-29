@@ -1,1917 +1,2111 @@
-#!/usr/bin/env python3
 """
-improved_mine_gui.py - 改进版露天矿多车协同调度系统GUI
-修复递归问题，完善骨干路径可视化，展示冲突消解能力
+traffic_manager.py - 完整优化的ECBS集成交通管理器
+集成了骨干路径感知、节点级时间窗口管理、智能路径切换和停车等待决策
 """
 
-import sys
-import os
 import math
 import time
-import json
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
+import threading
+import heapq
+from typing import List, Dict, Tuple, Optional, Any, Set
+from collections import defaultdict, deque, OrderedDict
+from dataclasses import dataclass, field
 from enum import Enum
+import copy
+from sortedcontainers import SortedList
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPointF, QRectF
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QLabel, QComboBox, QSpinBox, QDoubleSpinBox,
-    QProgressBar, QTextEdit, QFileDialog, QMessageBox, QSplitter,
-    QGroupBox, QGridLayout, QTableWidget, QTableWidgetItem,
-    QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QDockWidget,
-    QGraphicsRectItem, QGraphicsPathItem, QTabWidget, QFrame,
-    QSlider, QCheckBox, QGraphicsItemGroup, QGraphicsPolygonItem, 
-    QGraphicsLineItem, QGraphicsTextItem, QAction, QMenuBar, QMenu
-)
-from PyQt5.QtGui import (
-    QPen, QBrush, QColor, QPainter, QPainterPath, QFont, QIcon,
-    QPolygonF, QTransform
-)
+class ConflictType(Enum):
+    """冲突类型"""
+    SAFETY_RECTANGLE = "safety_rectangle"
+    INTERFACE = "interface"
+    BACKBONE_CONGESTION = "backbone_congestion"
+    TEMPORAL = "temporal"
+    CAPACITY = "capacity"
+    NODE_OCCUPATION = "node_occupation"  # 新增：节点占用冲突
+    NARROW_PASSAGE = "narrow_passage"    # 新增：狭窄通道冲突
+    ACCESS_POINT = "access_point"        # 新增：接入点冲突
 
-# 导入系统组件
-try:
-    from optimized_backbone_network import OptimizedBackboneNetwork
-    from optimized_planner_config import EnhancedPathPlannerWithConfig
-    from traffic_manager import OptimizedTrafficManagerWithECBS
-    from vehicle_scheduler import EnhancedVehicleScheduler
-    from environment import OptimizedOpenPitMineEnv
-    COMPONENTS_AVAILABLE = True
-except ImportError as e:
-    print(f"⚠️ 组件导入失败: {e}")
-    COMPONENTS_AVAILABLE = False
-    sys.exit(1)
+class ConstraintType(Enum):
+    """约束类型"""
+    VERTEX = "vertex"
+    EDGE = "edge"
+    BACKBONE = "backbone"
+    CAPACITY = "capacity"
+    NODE = "node"              # 新增：节点约束
+    PATH_SWITCH = "path_switch" # 新增：路径切换约束
+    PARKING = "parking"        # 新增：停车约束
 
-# 配色方案
-COLORS = {
-    'bg': QColor(45, 47, 57),
-    'surface': QColor(55, 58, 71),
-    'primary': QColor(66, 135, 245),
-    'success': QColor(16, 185, 129),
-    'warning': QColor(245, 158, 11),
-    'error': QColor(239, 68, 68),
-    'text': QColor(229, 231, 235),
-    'muted': QColor(156, 163, 175),
-    'border': QColor(75, 85, 99),
-    'backbone': QColor(147, 51, 234),  # 紫色用于骨干路径
-    'interface': QColor(59, 130, 246), # 蓝色用于接口节点
-    'conflict': QColor(239, 68, 68),  # 红色用于冲突
-}
-
-# 车辆状态颜色
-VEHICLE_COLORS = {
-    'idle': QColor(156, 163, 175),
-    'loading': QColor(16, 185, 129),
-    'unloading': QColor(245, 158, 11),
-    'moving': QColor(66, 135, 245),
-    'waiting': QColor(168, 85, 247),
-    'planning': QColor(244, 63, 94),
-    'coordinating': QColor(34, 197, 94),
-}
-
-
-class BackboneInterfaceItem(QGraphicsItemGroup):
-    """骨干网络接口节点图形项"""
+@dataclass
+class ECBSConstraint:
+    """ECBS约束"""
+    constraint_type: ConstraintType
+    agent: Optional[str] = None
+    position: Optional[Tuple] = None
+    position2: Optional[Tuple] = None
+    time: Optional[int] = None
+    time_window: Optional[Tuple[int, int]] = None
+    backbone_id: Optional[str] = None
+    max_agents: Optional[int] = None
+    node_id: Optional[str] = None  # 新增：节点ID
     
-    def __init__(self, interface_id: str, position: Tuple[float, float], 
-                 path_id: str, index: int):
-        super().__init__()
-        self.interface_id = interface_id
-        self.position = position
-        self.path_id = path_id
-        self.index = index
-        
-        # 创建节点圆形
-        self.node = QGraphicsEllipseItem(-1, -1, 2, 2, self)
-        self.node.setBrush(QBrush(COLORS['interface']))
-        self.node.setPen(QPen(COLORS['interface'].darker(150), 0.5))
-        self.node.setZValue(15)
-        
-        # 创建标签
-        self.label = QGraphicsTextItem(f"I{index}", self)
-        self.label.setDefaultTextColor(COLORS['text'])
-        self.label.setFont(QFont("Arial", 1))
-        self.label.setPos(-10, -20)
-        self.label.setZValue(16)
-        
-        # 设置位置
-        self.setPos(position[0], position[1])
-        
-        # 默认隐藏标签
-        self.label.setVisible(False)
-    
-    def set_highlighted(self, highlighted: bool):
-        """设置高亮状态"""
-        if highlighted:
-            self.node.setBrush(QBrush(COLORS['warning']))
-            self.node.setPen(QPen(COLORS['warning'].darker(150), 1))
-            self.label.setVisible(True)
-        else:
-            self.node.setBrush(QBrush(COLORS['interface']))
-            self.node.setPen(QPen(COLORS['interface'].darker(150), 1))
-            self.label.setVisible(False)
+    def __hash__(self):
+        return hash((self.constraint_type, self.agent, self.position, 
+                    self.time, self.backbone_id, self.node_id))
 
-
-class BackbonePathItem(QGraphicsPathItem):
-    """骨干路径图形项"""
+@dataclass
+class BackboneNodeConstraint(ECBSConstraint):
+    """骨干路径节点约束"""
+    node_id: str
+    backbone_path_id: str
+    time_window: Tuple[float, float]
     
-    def __init__(self, path_id: str, path_data: Any):
-        super().__init__()
-        self.path_id = path_id
-        self.path_data = path_data
-        self.setZValue(-20)  # 在底层
-        
-        # 创建路径
-        self.update_path()
-        
-        # 设置样式
-        self.update_style()
+    def __post_init__(self):
+        self.constraint_type = ConstraintType.NODE
     
-    def update_path(self):
-        """更新路径"""
-        if not self.path_data.forward_path or len(self.path_data.forward_path) < 2:
-            return
-        
-        painter_path = QPainterPath()
-        painter_path.moveTo(self.path_data.forward_path[0][0], 
-                           self.path_data.forward_path[0][1])
-        
-        for point in self.path_data.forward_path[1:]:
-            painter_path.lineTo(point[0], point[1])
-        
-        self.setPath(painter_path)
-    
-    def update_style(self):
-        """更新样式（根据负载）"""
-        load_factor = self.path_data.get_load_factor()
-        quality = self.path_data.quality
-        
-        # 根据负载设置颜色和宽度
-        if load_factor > 0.8:
-            color = COLORS['error']
-            width = 3.0
-        elif load_factor > 0.5:
-            color = COLORS['warning']
-            width = 2.5
-        else:
-            color = COLORS['backbone']
-            width = 2.0
-        
-        # 根据质量调整透明度
-        color.setAlphaF(0.5 + quality * 0.5)
-        
-        pen = QPen(color, width)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setStyle(Qt.DashLine if quality < 0.6 else Qt.SolidLine)
-        self.setPen(pen)
-    
-    def set_highlighted(self, highlighted: bool):
-        """设置高亮状态"""
-        if highlighted:
-            pen = self.pen()
-            pen.setWidth(pen.width() + 1)
-            pen.setStyle(Qt.SolidLine)
-            color = pen.color()
-            color.setAlphaF(1.0)
-            pen.setColor(color)
-            self.setPen(pen)
-        else:
-            self.update_style()
-
-
-class ConflictMarker(QGraphicsItemGroup):
-    """冲突标记"""
-    
-    def __init__(self, conflict_id: str, position: Tuple[float, float], 
-                 severity: float = 1.0):
-        super().__init__()
-        self.conflict_id = conflict_id
-        self.position = position
-        self.severity = severity
-        
-        # 冲突区域（半透明圆）
-        radius = 10 + severity * 10
-        self.area = QGraphicsEllipseItem(-radius, -radius, radius*2, radius*2, self)
-        self.area.setBrush(QBrush(QColor(239, 68, 68, 50)))
-        self.area.setPen(QPen(Qt.NoPen))
-        self.area.setZValue(25)
-        
-        # 冲突中心标记
-        self.marker = QGraphicsEllipseItem(-1, -1, 2, 2, self)
-        self.marker.setBrush(QBrush(COLORS['conflict']))
-        self.marker.setPen(QPen(COLORS['conflict'].darker(150), 1))
-        self.marker.setZValue(26)
-        
-        # 脉冲动画效果
-        self.pulse_timer = QTimer()
-        self.pulse_timer.timeout.connect(self._pulse_animation)
-        self.pulse_timer.start(50)
-        self.pulse_phase = 0
-        
-        self.setPos(position[0], position[1])
-    
-    def _pulse_animation(self):
-        """脉冲动画"""
-        self.pulse_phase = (self.pulse_phase + 0.1) % (2 * math.pi)
-        scale = 1.0 + 0.2 * math.sin(self.pulse_phase)
-        self.marker.setScale(scale)
-        
-        # 更新透明度
-        alpha = int(50 + 30 * math.sin(self.pulse_phase))
-        color = QColor(239, 68, 68, alpha)
-        self.area.setBrush(QBrush(color))
-    
-    def cleanup(self):
-        """清理资源"""
-        self.pulse_timer.stop()
-
-
-class EnhancedVehicleItem(QGraphicsItemGroup):
-    """增强的车辆图形项"""
-    
-    def __init__(self, vehicle_id: str, vehicle_data):
-        super().__init__()
-        self.vehicle_id = vehicle_id
-        self.vehicle_data = vehicle_data
-        self.position = vehicle_data.get('position', (0, 0, 0))
-        self.update_lock = False  # 防止递归更新
-        
-        # 车辆形状
-        self.body = QGraphicsPolygonItem(self)
-        self.body.setZValue(10)
-        
-        # 方向指示器
-        self.direction = QGraphicsLineItem(self)
-        self.direction.setZValue(11)
-        
-        # ID标签
-        self.label = QGraphicsTextItem(str(vehicle_id), self)
-        self.label.setDefaultTextColor(COLORS['text'])
-        self.label.setFont(QFont("Arial", 1, QFont.Bold))
-        self.label.setZValue(12)
-        
-        # 状态指示器
-        self.status_indicator = QGraphicsEllipseItem(self)
-        self.status_indicator.setZValue(13)
-        
-        # 安全矩形
-        self.safety_rect = QGraphicsRectItem(self)
-        self.safety_rect.setZValue(5)
-        self.safety_rect.setVisible(False)
-        
-        # 冲突警告标记
-        self.conflict_warning = QGraphicsEllipseItem(self)
-        self.conflict_warning.setZValue(14)
-        self.conflict_warning.setVisible(False)
-        
-        self.update_appearance()
-        self.update_position()
-    
-    def update_appearance(self):
-        """更新外观"""
-        if self.update_lock:
-            return
+    def applies_to_path(self, path: List[Tuple], path_structure: Dict) -> bool:
+        """检查约束是否适用于给定路径"""
+        if path_structure.get('path_id') != self.backbone_path_id:
+            return False
             
-        status = self.vehicle_data.get('status', 'idle')
-        color = VEHICLE_COLORS.get(status, VEHICLE_COLORS['idle'])
-        
-        # 车身
-        self.body.setBrush(QBrush(color))
-        self.body.setPen(QPen(color.darker(150), 1))
-        
-        # 方向线
-        self.direction.setPen(QPen(COLORS['text'], 1))
-        
-        # 状态指示器
-        self.status_indicator.setBrush(QBrush(color.lighter(150)))
-        self.status_indicator.setPen(QPen(Qt.NoPen))
-        self.status_indicator.setRect(-1, -1, 2, 2)
-        
-        # 安全矩形
-        self._update_safety_rect()
-        
-        # 冲突警告
-        self._update_conflict_warning()
+        # 检查路径是否经过该节点
+        for i, point in enumerate(path):
+            if self._is_node_position(point, self.node_id):
+                # 计算到达该节点的时间
+                arrival_time = self._calculate_arrival_time(path, i)
+                # 检查是否在约束时间窗口内
+                return (self.time_window[0] <= arrival_time <= self.time_window[1])
+        return False
     
-    def _update_safety_rect(self):
-        """更新安全矩形"""
-        safety_params = self.vehicle_data.get('safety_params', {})
-        if safety_params:
-            if hasattr(safety_params, 'length'):
-                length = safety_params.length + safety_params.safety_margin * 2
-                width = safety_params.width + safety_params.safety_margin * 2
+    def _is_node_position(self, point: Tuple, node_id: str) -> bool:
+        """检查点是否为指定节点"""
+        # 这里需要从backbone_network获取节点位置信息
+        # 简化实现
+        return False
+    
+    def _calculate_arrival_time(self, path: List[Tuple], index: int) -> float:
+        """计算到达指定索引的时间"""
+        # 简化实现：假设匀速运动
+        return index * 1.0
+
+@dataclass
+class ParkingDecision:
+    """停车决策"""
+    vehicle_id: str
+    parking_position: Tuple[float, float, float]
+    parking_duration: float
+    start_time: float
+    reason: str
+    priority_vehicle_id: Optional[str] = None
+    expected_resolution_time: Optional[float] = None
+
+@dataclass
+class ECBSConflict:
+    """ECBS冲突"""
+    conflict_id: str
+    conflict_type: ConflictType
+    agents: List[str]
+    location: Tuple[float, float]
+    time: int
+    severity: float = 1.0
+    backbone_id: Optional[str] = None
+    node_id: Optional[str] = None  # 新增：节点ID
+    
+    def __lt__(self, other):
+        return self.severity > other.severity
+
+class ECBSNode:
+    """ECBS搜索树节点"""
+    
+    def __init__(self):
+        self.constraints: Set[ECBSConstraint] = set()
+        self.solution: Dict[str, List[Tuple]] = {}
+        self.cost: float = 0.0
+        self.conflicts: List[ECBSConflict] = []
+        self.h_value: float = 0.0
+        self.f_value: float = 0.0
+        self.parking_decisions: Dict[str, ParkingDecision] = {}  # 新增：停车决策
+        self.path_switches: Dict[str, str] = {}  # 新增：路径切换记录
+    
+    def __lt__(self, other):
+        if abs(self.f_value - other.f_value) < 1e-6:
+            return len(self.conflicts) < len(other.conflicts)
+        return self.f_value < other.f_value
+
+
+class NodeTimeWindowManager:
+    """节点级时间窗口管理器"""
+    
+    def __init__(self, backbone_network):
+        self.backbone_network = backbone_network
+        self.node_reservations = defaultdict(SortedList)  # {node_id: SortedList[(start_time, end_time, vehicle_id)]}
+        self.node_safety_margin = 5.0  # 节点安全时间间隔
+        self.node_traversal_time = 3.0  # 默认节点通过时间
+        
+    def check_node_availability(self, node_id: str, vehicle_id: str, 
+                               arrival_time: float, duration: float) -> bool:
+        """检查节点在指定时间窗口是否可用"""
+        if node_id not in self.node_reservations:
+            return True
+            
+        # 检查与现有预约的冲突
+        for start, end, occupant in self.node_reservations[node_id]:
+            if occupant == vehicle_id:
+                continue
+            # 添加安全边际的时间窗口检查
+            if not (arrival_time + duration + self.node_safety_margin <= start or 
+                    arrival_time >= end + self.node_safety_margin):
+                return False
+        return True
+    
+    def reserve_node_sequence(self, path: List[Tuple], vehicle_id: str, 
+                            start_time: float, speed: float = 1.0) -> Optional[List[Tuple]]:
+        """预约路径上的节点序列"""
+        reservations = []
+        current_time = start_time
+        
+        # 获取路径上的所有骨干节点
+        backbone_nodes = self._extract_backbone_nodes(path)
+        
+        for node_info in backbone_nodes:
+            node_id = node_info['node_id']
+            node_index = node_info['path_index']
+            
+            # 计算到达时间
+            arrival_time = self._calculate_arrival_time(path, node_index, start_time, speed)
+            duration = self.node_traversal_time
+            
+            if self.check_node_availability(node_id, vehicle_id, arrival_time, duration):
+                reservations.append((node_id, arrival_time, arrival_time + duration))
             else:
-                length = safety_params.get('length', 6.0) + safety_params.get('safety_margin', 1.5) * 2
-                width = safety_params.get('width', 3.0) + safety_params.get('safety_margin', 1.5) * 2
+                return None  # 预约失败
+                
+        return reservations
+    
+    def _extract_backbone_nodes(self, path: List[Tuple]) -> List[Dict]:
+        """提取路径上的骨干节点"""
+        nodes = []
+        if not self.backbone_network:
+            return nodes
             
-            self.safety_rect.setRect(-length/2, -width/2, length, width)
-            self.safety_rect.setBrush(QBrush(Qt.NoBrush))
-            self.safety_rect.setPen(QPen(QColor(255, 255, 0, 80), 1, Qt.DashLine))
+        # 遍历路径，找出属于骨干网络的节点
+        for i, point in enumerate(path):
+            # 检查是否为骨干接口节点
+            for interface_id, interface_info in self.backbone_network.backbone_interfaces.items():
+                if self._is_same_position(point, interface_info['position']):
+                    nodes.append({
+                        'node_id': interface_id,
+                        'path_index': i,
+                        'position': point
+                    })
+                    break
+                    
+        return nodes
     
-    def _update_conflict_warning(self):
-        """更新冲突警告"""
-        if hasattr(self.vehicle_data, 'in_conflict') and self.vehicle_data.in_conflict:
-            self.conflict_warning.setVisible(True)
-            self.conflict_warning.setRect(-8, -8, 16, 16)
-            self.conflict_warning.setBrush(QBrush(QColor(239, 68, 68, 100)))
-            self.conflict_warning.setPen(QPen(COLORS['error'], 1))
-        else:
-            self.conflict_warning.setVisible(False)
+    def _is_same_position(self, pos1: Tuple, pos2: Tuple, tolerance: float = 2.0) -> bool:
+        """判断两个位置是否相同"""
+        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2) < tolerance
     
-    def update_position(self):
-        """更新位置"""
-        if self.update_lock:
-            return
+    def _calculate_arrival_time(self, path: List[Tuple], index: int, 
+                               start_time: float, speed: float) -> float:
+        """计算到达指定索引的时间"""
+        if index <= 0:
+            return start_time
             
-        x, y = self.position[0], self.position[1]
-        theta = self.position[2] if len(self.position) > 2 else 0
-        
-        # 车辆形状
-        length, width = 6.0, 3.0
-        points = [
-            QPointF(length/2, 0),
-            QPointF(length/3, width/2),
-            QPointF(-length/2, width/2),
-            QPointF(-length/2, -width/2),
-            QPointF(length/3, -width/2)
-        ]
-        
-        # 应用变换
-        transform = QTransform()
-        transform.translate(x, y)
-        transform.rotate(math.degrees(theta))
-        
-        polygon = QPolygonF()
-        for point in points:
-            polygon.append(transform.map(point))
-        
-        self.body.setPolygon(polygon)
-        
-        # 更新其他组件位置
-        self.label.setPos(x - 15, y - 25)
-        self.status_indicator.setPos(x, y)
-        self.safety_rect.setPos(x, y)
-        self.safety_rect.setRotation(math.degrees(theta))
-        self.conflict_warning.setPos(x, y)
-        
-        # 方向线
-        line_length = 4
-        end_x = x + line_length * math.cos(theta)
-        end_y = y + line_length * math.sin(theta)
-        self.direction.setLine(x, y, end_x, end_y)
-    
-    def update_data(self, vehicle_data):
-        """更新数据（防止递归）"""
-        if self.update_lock:
-            return
+        # 计算从起点到该索引的距离
+        distance = 0.0
+        for i in range(index):
+            distance += math.sqrt(
+                (path[i+1][0] - path[i][0])**2 + 
+                (path[i+1][1] - path[i][1])**2
+            )
             
-        self.update_lock = True
-        try:
-            self.vehicle_data = vehicle_data
-            self.position = vehicle_data.get('position', self.position)
-            self.update_position()
-            self.update_appearance()
-        finally:
-            self.update_lock = False
+        travel_time = distance / speed
+        return start_time + travel_time
     
-    def set_safety_rect_visible(self, visible: bool):
-        """设置安全矩形可见性"""
-        self.safety_rect.setVisible(visible)
+    def release_node_reservations(self, vehicle_id: str):
+        """释放车辆的所有节点预约"""
+        for node_id in list(self.node_reservations.keys()):
+            self.node_reservations[node_id] = SortedList(
+                [(start, end, vid) for start, end, vid in self.node_reservations[node_id]
+                 if vid != vehicle_id]
+            )
 
 
-class ImprovedMineScene(QGraphicsScene):
-    """改进的矿场场景"""
+class BackbonePathSwitcher:
+    """骨干路径切换器"""
+    
+    def __init__(self, backbone_network, path_planner):
+        self.backbone_network = backbone_network
+        self.path_planner = path_planner
+        self.switch_history = defaultdict(list)  # 记录切换历史
+        
+    def find_alternative_backbone_path(self, vehicle_id: str, current_pos: Tuple, 
+                                     goal: Dict, conflict_info: Dict, 
+                                     used_paths: Set[str]) -> Optional[Dict]:
+        """寻找替代骨干路径"""
+        
+        # 1. 获取所有可用骨干路径
+        available_paths = self._get_available_backbone_paths(goal, used_paths)
+        
+        if not available_paths:
+            return None
+            
+        # 2. 评估每条路径
+        path_evaluations = []
+        for path_id, path_data in available_paths.items():
+            score = self._evaluate_alternative_path(
+                path_data, current_pos, conflict_info, vehicle_id
+            )
+            path_evaluations.append((score, path_id, path_data))
+        
+        # 3. 按评分排序，选择最佳替代路径
+        path_evaluations.sort(reverse=True)
+        
+        for score, path_id, path_data in path_evaluations:
+            # 尝试找到无冲突的接入点
+            access_point = self._find_conflict_free_access(
+                current_pos, path_data, conflict_info
+            )
+            if access_point:
+                # 记录切换历史
+                self.switch_history[vehicle_id].append({
+                    'time': time.time(),
+                    'from_path': conflict_info.get('current_path_id'),
+                    'to_path': path_id,
+                    'reason': conflict_info.get('conflict_type')
+                })
+                
+                return {
+                    'path_id': path_id,
+                    'access_point': access_point,
+                    'path_data': path_data,
+                    'score': score
+                }
+        
+        return None
+    
+    def _get_available_backbone_paths(self, goal: Dict, used_paths: Set[str]) -> Dict:
+        """获取可用的骨干路径"""
+        if not self.backbone_network:
+            return {}
+            
+        # 使用backbone_network的方法查找到目标的所有路径
+        all_paths = {}
+        target_type = goal.get('type', 'unloading')
+        target_id = goal.get('id', 0)
+        
+        # 查找连接到目标的所有骨干路径
+        for path_id, path_data in self.backbone_network.bidirectional_paths.items():
+            # 检查路径是否连接到目标
+            if ((path_data.point_a['type'] == target_type and path_data.point_a['id'] == target_id) or
+                (path_data.point_b['type'] == target_type and path_data.point_b['id'] == target_id)):
+                
+                # 排除已使用的路径
+                if path_id not in used_paths:
+                    all_paths[path_id] = path_data
+                    
+        return all_paths
+    
+    def _evaluate_alternative_path(self, path_data: Any, current_pos: Tuple, 
+                                  conflict_info: Dict, vehicle_id: str) -> float:
+        """评估替代路径的得分"""
+        score = 1.0
+        
+        # 1. 路径质量
+        score *= path_data.quality
+        
+        # 2. 当前负载（负载越低越好）
+        load_factor = path_data.get_load_factor()
+        score *= (1.0 - load_factor * 0.5)
+        
+        # 3. 距离因素（接入距离越近越好）
+        min_access_distance = self._calculate_min_access_distance(current_pos, path_data)
+        distance_score = 1.0 / (1.0 + min_access_distance / 100.0)
+        score *= distance_score
+        
+        # 4. 历史切换频率（频繁切换的路径降低评分）
+        switch_count = self._get_recent_switch_count(vehicle_id, path_data.path_id)
+        if switch_count > 2:
+            score *= 0.7
+            
+        return score
+    
+    def _find_conflict_free_access(self, current_pos: Tuple, path_data: Any, 
+                                  conflict_info: Dict) -> Optional[Dict]:
+        """找到无冲突的接入点"""
+        # 获取路径上的所有接口节点
+        interface_nodes = self._get_path_interface_nodes(path_data)
+        
+        best_access = None
+        min_cost = float('inf')
+        
+        for node_info in interface_nodes:
+            # 检查节点是否在冲突区域内
+            if self._is_node_conflict_free(node_info, conflict_info):
+                # 计算接入成本
+                access_cost = self._calculate_access_cost(current_pos, node_info)
+                
+                if access_cost < min_cost:
+                    min_cost = access_cost
+                    best_access = {
+                        'node_id': node_info['id'],
+                        'position': node_info['position'],
+                        'cost': access_cost
+                    }
+                    
+        return best_access
+    
+    def _calculate_min_access_distance(self, current_pos: Tuple, path_data: Any) -> float:
+        """计算最小接入距离"""
+        min_distance = float('inf')
+        
+        # 检查前向路径
+        for point in path_data.forward_path:
+            distance = math.sqrt((point[0] - current_pos[0])**2 + (point[1] - current_pos[1])**2)
+            min_distance = min(min_distance, distance)
+            
+        return min_distance
+    
+    def _get_recent_switch_count(self, vehicle_id: str, path_id: str) -> int:
+        """获取最近切换到该路径的次数"""
+        if vehicle_id not in self.switch_history:
+            return 0
+            
+        recent_time = time.time() - 300  # 最近5分钟
+        count = 0
+        
+        for switch in self.switch_history[vehicle_id]:
+            if switch['time'] > recent_time and switch['to_path'] == path_id:
+                count += 1
+                
+        return count
+    
+    def _get_path_interface_nodes(self, path_data: Any) -> List[Dict]:
+        """获取路径的接口节点"""
+        nodes = []
+        
+        if not self.backbone_network:
+            return nodes
+            
+        # 从backbone_network获取该路径的接口节点
+        path_id = path_data.path_id
+        if path_id in self.backbone_network.path_interfaces:
+            for interface_id in self.backbone_network.path_interfaces[path_id]:
+                if interface_id in self.backbone_network.backbone_interfaces:
+                    interface_info = self.backbone_network.backbone_interfaces[interface_id]
+                    nodes.append({
+                        'id': interface_id,
+                        'position': interface_info['position'],
+                        'is_occupied': interface_info.get('is_occupied', False)
+                    })
+                    
+        return nodes
+    
+    def _is_node_conflict_free(self, node_info: Dict, conflict_info: Dict) -> bool:
+        """检查节点是否无冲突"""
+        # 检查节点是否被占用
+        if node_info.get('is_occupied', False):
+            return False
+            
+        # 检查节点是否在冲突区域内
+        conflict_location = conflict_info.get('location')
+        if conflict_location:
+            node_pos = node_info['position']
+            distance = math.sqrt(
+                (node_pos[0] - conflict_location[0])**2 + 
+                (node_pos[1] - conflict_location[1])**2
+            )
+            # 如果节点离冲突位置太近，认为不安全
+            if distance < 20.0:
+                return False
+                
+        return True
+    
+    def _calculate_access_cost(self, current_pos: Tuple, node_info: Dict) -> float:
+        """计算接入成本"""
+        node_pos = node_info['position']
+        distance = math.sqrt(
+            (node_pos[0] - current_pos[0])**2 + 
+            (node_pos[1] - current_pos[1])**2
+        )
+        return distance
+
+
+class IntelligentParkingDecisionMaker:
+    """智能停车等待决策器"""
+    
+    def __init__(self, env, traffic_manager):
+        self.env = env
+        self.traffic_manager = traffic_manager
+        self.default_parking_duration = 20.0
+        self.parking_safety_distance = 15.0
+        
+    def should_park_and_wait(self, vehicle_id: str, conflict_analysis: Dict) -> Tuple[bool, Optional[ParkingDecision]]:
+        """决定是否应该停车等待"""
+        
+        conflict_type = conflict_analysis.get('type')
+        
+        if conflict_type == 'narrow_passage':
+            # 狭窄通道冲突
+            return self._handle_narrow_passage_conflict(vehicle_id, conflict_analysis)
+            
+        elif conflict_type == 'intersection':
+            # 交叉口冲突
+            return self._handle_intersection_conflict(vehicle_id, conflict_analysis)
+            
+        elif conflict_type == 'resource_exhausted':
+            # 所有路径都被占用
+            return self._handle_resource_exhausted(vehicle_id, conflict_analysis)
+            
+        elif conflict_type == 'node_occupation':
+            # 节点占用冲突
+            return self._handle_node_occupation_conflict(vehicle_id, conflict_analysis)
+            
+        return False, None
+    
+    def _handle_narrow_passage_conflict(self, vehicle_id: str, 
+                                      conflict_analysis: Dict) -> Tuple[bool, Optional[ParkingDecision]]:
+        """处理狭窄通道冲突"""
+        conflicting_vehicles = conflict_analysis.get('conflicting_vehicles', [])
+        vehicle_priorities = conflict_analysis.get('priorities', {})
+        
+        # 获取自己的优先级
+        my_priority = vehicle_priorities.get(vehicle_id, 0.5)
+        
+        # 检查是否是优先级最低的车辆
+        should_yield = True
+        priority_vehicle = None
+        
+        for other_id in conflicting_vehicles:
+            if other_id != vehicle_id:
+                other_priority = vehicle_priorities.get(other_id, 0.5)
+                if my_priority > other_priority:
+                    should_yield = False
+                else:
+                    priority_vehicle = other_id
+                    
+        if should_yield:
+            # 找到安全停车位置
+            parking_position = self._find_safe_parking_position(
+                vehicle_id, conflict_analysis.get('location')
+            )
+            
+            if parking_position:
+                parking_decision = ParkingDecision(
+                    vehicle_id=vehicle_id,
+                    parking_position=parking_position,
+                    parking_duration=self.default_parking_duration,
+                    start_time=time.time(),
+                    reason='narrow_passage_yield',
+                    priority_vehicle_id=priority_vehicle
+                )
+                return True, parking_decision
+                
+        return False, None
+    
+    def _handle_intersection_conflict(self, vehicle_id: str, 
+                                    conflict_analysis: Dict) -> Tuple[bool, Optional[ParkingDecision]]:
+        """处理交叉口冲突"""
+        # 基于到达时间和优先级决定
+        arrival_times = conflict_analysis.get('arrival_times', {})
+        my_arrival = arrival_times.get(vehicle_id, float('inf'))
+        
+        # 检查是否有车辆会先到达
+        for other_id, other_arrival in arrival_times.items():
+            if other_id != vehicle_id and other_arrival < my_arrival - 5.0:
+                # 其他车辆明显先到，应该等待
+                parking_position = self._find_safe_parking_position(
+                    vehicle_id, conflict_analysis.get('location')
+                )
+                
+                if parking_position:
+                    # 计算需要等待的时间
+                    wait_time = max(self.default_parking_duration, other_arrival - my_arrival + 10.0)
+                    
+                    parking_decision = ParkingDecision(
+                        vehicle_id=vehicle_id,
+                        parking_position=parking_position,
+                        parking_duration=wait_time,
+                        start_time=time.time(),
+                        reason='intersection_yield',
+                        expected_resolution_time=time.time() + wait_time
+                    )
+                    return True, parking_decision
+                    
+        return False, None
+    
+    def _handle_resource_exhausted(self, vehicle_id: str, 
+                                 conflict_analysis: Dict) -> Tuple[bool, Optional[ParkingDecision]]:
+        """处理资源耗尽（所有路径都被占用）"""
+        # 必须停车等待
+        current_position = conflict_analysis.get('current_position')
+        parking_position = self._find_safe_parking_position(vehicle_id, current_position)
+        
+        if parking_position:
+            parking_decision = ParkingDecision(
+                vehicle_id=vehicle_id,
+                parking_position=parking_position,
+                parking_duration=self.default_parking_duration * 1.5,  # 延长等待时间
+                start_time=time.time(),
+                reason='resource_exhausted'
+            )
+            return True, parking_decision
+            
+        return False, None
+    
+    def _handle_node_occupation_conflict(self, vehicle_id: str, 
+                                       conflict_analysis: Dict) -> Tuple[bool, Optional[ParkingDecision]]:
+        """处理节点占用冲突"""
+        occupied_until = conflict_analysis.get('occupied_until', time.time() + self.default_parking_duration)
+        current_time = time.time()
+        wait_time = max(10.0, occupied_until - current_time + 5.0)
+        
+        parking_position = self._find_safe_parking_position(
+            vehicle_id, conflict_analysis.get('location')
+        )
+        
+        if parking_position:
+            parking_decision = ParkingDecision(
+                vehicle_id=vehicle_id,
+                parking_position=parking_position,
+                parking_duration=wait_time,
+                start_time=current_time,
+                reason='node_occupation_wait',
+                expected_resolution_time=occupied_until
+            )
+            return True, parking_decision
+            
+        return False, None
+    
+    def _find_safe_parking_position(self, vehicle_id: str, 
+                                  reference_position: Optional[Tuple]) -> Optional[Tuple]:
+        """找到安全的停车位置"""
+        if not reference_position:
+            # 使用车辆当前位置
+            if self.env and vehicle_id in self.env.vehicles:
+                vehicle = self.env.vehicles[vehicle_id]
+                reference_position = getattr(vehicle, 'position', (0, 0, 0))
+            else:
+                return None
+                
+        # 在参考位置周围寻找安全位置
+        search_angles = [0, 45, 90, 135, 180, 225, 270, 315]
+        search_distances = [10, 15, 20, 25]
+        
+        for distance in search_distances:
+            for angle in search_angles:
+                rad = math.radians(angle)
+                candidate = (
+                    reference_position[0] + distance * math.cos(rad),
+                    reference_position[1] + distance * math.sin(rad),
+                    reference_position[2] if len(reference_position) > 2 else 0
+                )
+                
+                if self._is_position_safe_for_parking(candidate, vehicle_id):
+                    return candidate
+                    
+        return None
+    
+    def _is_position_safe_for_parking(self, position: Tuple, vehicle_id: str) -> bool:
+        """检查位置是否适合停车"""
+        # 检查是否在地图范围内
+        if not self.env:
+            return False
+            
+        x, y = position[0], position[1]
+        if x < 0 or x >= self.env.width or y < 0 or y >= self.env.height:
+            return False
+            
+        # 检查是否有障碍物
+        if hasattr(self.env, 'grid') and self.env.grid[int(x), int(y)] == 1:
+            return False
+            
+        # 检查与其他车辆的距离
+        if hasattr(self.env, 'vehicles'):
+            for other_id, other_vehicle in self.env.vehicles.items():
+                if other_id != vehicle_id:
+                    other_pos = getattr(other_vehicle, 'position', (0, 0, 0))
+                    distance = math.sqrt(
+                        (position[0] - other_pos[0])**2 + 
+                        (position[1] - other_pos[1])**2
+                    )
+                    if distance < self.parking_safety_distance:
+                        return False
+                        
+        return True
+    
+    def simulate_parking_outcome(self, parking_decision: ParkingDecision, 
+                               time_horizon: float = 30.0) -> Dict:
+        """模拟停车后的场景，预测冲突是否会解决"""
+        future_time = parking_decision.start_time + parking_decision.parking_duration
+        
+        # 预测系统状态
+        future_state = self._project_system_state(future_time)
+        
+        # 检查停车后是否还有冲突
+        future_conflicts = self._detect_conflicts_in_state(future_state, parking_decision.vehicle_id)
+        
+        # 计算最优等待时间
+        optimal_wait_time = parking_decision.parking_duration
+        if future_conflicts:
+            # 如果还有冲突，可能需要延长等待时间
+            additional_wait = self._calculate_additional_wait_time(future_conflicts)
+            optimal_wait_time += additional_wait
+            
+        return {
+            'conflicts_resolved': len(future_conflicts) == 0,
+            'remaining_conflicts': future_conflicts,
+            'recommended_wait_time': optimal_wait_time,
+            'confidence': self._calculate_prediction_confidence(future_time - time.time())
+        }
+    
+    def _project_system_state(self, future_time: float) -> Dict:
+        """预测未来的系统状态"""
+        projected_state = {
+            'vehicle_positions': {},
+            'occupied_nodes': {},
+            'active_paths': {}
+        }
+        
+        # 简化实现：基于当前速度和路径预测未来位置
+        if hasattr(self.traffic_manager, 'active_paths'):
+            for vehicle_id, path_info in self.traffic_manager.active_paths.items():
+                # 预测车辆位置
+                future_position = self._predict_vehicle_position(
+                    vehicle_id, path_info, future_time
+                )
+                projected_state['vehicle_positions'][vehicle_id] = future_position
+                
+        return projected_state
+    
+    def _detect_conflicts_in_state(self, state: Dict, parking_vehicle_id: str) -> List[Dict]:
+        """在给定状态下检测冲突"""
+        conflicts = []
+        
+        # 简化实现：检查位置冲突
+        positions = state.get('vehicle_positions', {})
+        parking_pos = positions.get(parking_vehicle_id)
+        
+        if not parking_pos:
+            return conflicts
+            
+        for other_id, other_pos in positions.items():
+            if other_id != parking_vehicle_id:
+                distance = math.sqrt(
+                    (parking_pos[0] - other_pos[0])**2 + 
+                    (parking_pos[1] - other_pos[1])**2
+                )
+                if distance < 10.0:  # 冲突距离阈值
+                    conflicts.append({
+                        'type': 'position_conflict',
+                        'vehicles': [parking_vehicle_id, other_id],
+                        'distance': distance
+                    })
+                    
+        return conflicts
+    
+    def _calculate_additional_wait_time(self, conflicts: List[Dict]) -> float:
+        """计算额外等待时间"""
+        # 基于冲突类型和严重程度计算
+        max_wait = 0.0
+        
+        for conflict in conflicts:
+            if conflict['type'] == 'position_conflict':
+                # 位置冲突需要等待对方通过
+                wait_time = 15.0  # 估计通过时间
+                max_wait = max(max_wait, wait_time)
+                
+        return max_wait
+    
+    def _predict_vehicle_position(self, vehicle_id: str, path_info: Dict, 
+                                future_time: float) -> Tuple:
+        """预测车辆未来位置"""
+        # 简化实现
+        current_pos = path_info.get('current_position', (0, 0, 0))
+        return current_pos
+    
+    def _calculate_prediction_confidence(self, time_delta: float) -> float:
+        """计算预测置信度"""
+        # 时间越远，置信度越低
+        return max(0.1, 1.0 - time_delta / 300.0)
+
+
+class EnhancedConflictDetector:
+    """增强冲突检测器 - 支持骨干路径特定冲突"""
+    
+    def __init__(self, env, backbone_network=None):
+        self.env = env
+        self.backbone_network = backbone_network
+        self.safety_margin = 3.0
+        self.node_conflict_radius = 5.0
+        
+    def detect_all_conflicts(self, solution: Dict[str, List[Tuple]], 
+                           backbone_info: Dict[str, Dict] = None) -> List[ECBSConflict]:
+        """检测所有冲突，包括骨干路径特定冲突"""
+        conflicts = []
+        
+        # 1. 基础时空冲突检测
+        basic_conflicts = self._detect_basic_conflicts(solution)
+        conflicts.extend(basic_conflicts)
+        
+        # 2. 骨干路径特定冲突检测
+        if backbone_info:
+            backbone_conflicts = self._detect_backbone_specific_conflicts(solution, backbone_info)
+            conflicts.extend(backbone_conflicts)
+            
+        return conflicts
+    
+    def _detect_basic_conflicts(self, solution: Dict[str, List[Tuple]]) -> List[ECBSConflict]:
+        """检测基础时空冲突"""
+        conflicts = []
+        agents = list(solution.keys())
+        
+        for i in range(len(agents)):
+            for j in range(i + 1, len(agents)):
+                agent1, agent2 = agents[i], agents[j]
+                path1, path2 = solution[agent1], solution[agent2]
+                
+                # 时间-空间冲突检测
+                temporal_conflicts = self._detect_temporal_conflicts(
+                    agent1, agent2, path1, path2
+                )
+                conflicts.extend(temporal_conflicts)
+                
+        return conflicts
+    
+    def _detect_backbone_specific_conflicts(self, solution: Dict[str, List[Tuple]], 
+                                          backbone_info: Dict[str, Dict]) -> List[ECBSConflict]:
+        """检测骨干路径特定冲突"""
+        conflicts = []
+        
+        # 1. 节点占用冲突
+        node_conflicts = self._detect_node_occupation_conflicts(solution, backbone_info)
+        conflicts.extend(node_conflicts)
+        
+        # 2. 狭窄通道冲突
+        narrow_passage_conflicts = self._detect_narrow_passage_conflicts(solution, backbone_info)
+        conflicts.extend(narrow_passage_conflicts)
+        
+        # 3. 接入点冲突
+        access_conflicts = self._detect_access_point_conflicts(solution, backbone_info)
+        conflicts.extend(access_conflicts)
+        
+        return conflicts
+    
+    def _detect_node_occupation_conflicts(self, solution: Dict[str, List[Tuple]], 
+                                        backbone_info: Dict[str, Dict]) -> List[ECBSConflict]:
+        """检测节点占用冲突"""
+        conflicts = []
+        node_occupations = defaultdict(list)  # {(node_id, time): [vehicles]}
+        
+        # 收集所有车辆的节点占用信息
+        for vehicle_id, path in solution.items():
+            if vehicle_id not in backbone_info:
+                continue
+                
+            vehicle_backbone = backbone_info[vehicle_id]
+            backbone_id = vehicle_backbone.get('backbone_id')
+            
+            if not backbone_id or not self.backbone_network:
+                continue
+                
+            # 提取路径上的骨干节点
+            nodes = self._extract_path_nodes(path, backbone_id)
+            
+            for node_info in nodes:
+                node_id = node_info['node_id']
+                arrival_time = node_info['arrival_time']
+                
+                # 量化时间到时间步
+                time_step = int(arrival_time)
+                
+                # 检查时间窗口内的占用
+                for t in range(time_step - 2, time_step + 3):
+                    node_occupations[(node_id, t)].append(vehicle_id)
+                    
+        # 检测冲突
+        for (node_id, time_step), vehicles in node_occupations.items():
+            if len(vehicles) > 1:
+                # 获取节点位置
+                node_position = self._get_node_position(node_id)
+                
+                conflict = ECBSConflict(
+                    conflict_id=f"node_{node_id}_{time_step}",
+                    conflict_type=ConflictType.NODE_OCCUPATION,
+                    agents=vehicles,
+                    location=node_position,
+                    time=time_step,
+                    severity=0.9,
+                    node_id=node_id
+                )
+                conflicts.append(conflict)
+                
+        return conflicts
+    
+    def _detect_narrow_passage_conflicts(self, solution: Dict[str, List[Tuple]], 
+                                       backbone_info: Dict[str, Dict]) -> List[ECBSConflict]:
+        """检测狭窄通道冲突"""
+        conflicts = []
+        
+        # 按骨干路径分组车辆
+        backbone_vehicles = defaultdict(list)
+        for vehicle_id, info in backbone_info.items():
+            backbone_id = info.get('backbone_id')
+            if backbone_id:
+                backbone_vehicles[backbone_id].append((vehicle_id, info))
+                
+        # 检查每条骨干路径上的车辆
+        for backbone_id, vehicles in backbone_vehicles.items():
+            if len(vehicles) < 2:
+                continue
+                
+            # 检查车辆之间的时空重叠
+            for i in range(len(vehicles)):
+                for j in range(i + 1, len(vehicles)):
+                    vehicle1_id, info1 = vehicles[i]
+                    vehicle2_id, info2 = vehicles[j]
+                    
+                    # 检查时间窗口重叠
+                    overlap = self._check_time_window_overlap(info1, info2)
+                    
+                    if overlap:
+                        # 找到冲突位置
+                        conflict_location = self._find_narrow_passage_location(
+                            solution[vehicle1_id], solution[vehicle2_id], overlap
+                        )
+                        
+                        conflict = ECBSConflict(
+                            conflict_id=f"narrow_{backbone_id}_{vehicle1_id}_{vehicle2_id}",
+                            conflict_type=ConflictType.NARROW_PASSAGE,
+                            agents=[vehicle1_id, vehicle2_id],
+                            location=conflict_location,
+                            time=overlap[0],
+                            severity=0.85,
+                            backbone_id=backbone_id
+                        )
+                        conflicts.append(conflict)
+                        
+        return conflicts
+    
+    def _detect_access_point_conflicts(self, solution: Dict[str, List[Tuple]], 
+                                     backbone_info: Dict[str, Dict]) -> List[ECBSConflict]:
+        """检测接入点冲突"""
+        conflicts = []
+        access_points = defaultdict(list)  # {(interface_id, time_window): [vehicles]}
+        
+        # 收集接入点使用信息
+        for vehicle_id, info in backbone_info.items():
+            if 'access_point' in info:
+                interface_id = info['access_point'].get('interface_id')
+                access_time = info['access_point'].get('time')
+                
+                if interface_id and access_time is not None:
+                    time_window = (int(access_time - 5), int(access_time + 5))
+                    access_points[(interface_id, time_window)].append(vehicle_id)
+                    
+        # 检测冲突
+        for (interface_id, time_window), vehicles in access_points.items():
+            if len(vehicles) > 1:
+                interface_position = self._get_interface_position(interface_id)
+                
+                conflict = ECBSConflict(
+                    conflict_id=f"access_{interface_id}_{time_window[0]}",
+                    conflict_type=ConflictType.ACCESS_POINT,
+                    agents=vehicles,
+                    location=interface_position,
+                    time=time_window[0],
+                    severity=0.8
+                )
+                conflicts.append(conflict)
+                
+        return conflicts
+    
+    def _detect_temporal_conflicts(self, agent1: str, agent2: str,
+                                 path1: List[Tuple], path2: List[Tuple]) -> List[ECBSConflict]:
+        """检测时间-空间冲突"""
+        conflicts = []
+        max_time = min(len(path1), len(path2))
+        
+        for t in range(max_time):
+            pos1, pos2 = path1[t], path2[t]
+            
+            # 顶点冲突检测
+            if self._positions_conflict(pos1, pos2):
+                conflict = ECBSConflict(
+                    conflict_id=f"vertex_{agent1}_{agent2}_{t}",
+                    conflict_type=ConflictType.TEMPORAL,
+                    agents=[agent1, agent2],
+                    location=((pos1[0] + pos2[0])/2, (pos1[1] + pos2[1])/2),
+                    time=t,
+                    severity=self._calculate_conflict_severity(pos1, pos2)
+                )
+                conflicts.append(conflict)
+            
+            # 边冲突检测
+            if t < max_time - 1:
+                next_pos1, next_pos2 = path1[t+1], path2[t+1]
+                if self._edge_conflict(pos1, next_pos1, pos2, next_pos2):
+                    conflict = ECBSConflict(
+                        conflict_id=f"edge_{agent1}_{agent2}_{t}",
+                        conflict_type=ConflictType.TEMPORAL,
+                        agents=[agent1, agent2],
+                        location=((pos1[0] + pos2[0])/2, (pos1[1] + pos2[1])/2),
+                        time=t,
+                        severity=0.8
+                    )
+                    conflicts.append(conflict)
+        
+        return conflicts
+    
+    def _extract_path_nodes(self, path: List[Tuple], backbone_id: str) -> List[Dict]:
+        """提取路径上的骨干节点"""
+        nodes = []
+        
+        if not self.backbone_network or backbone_id not in self.backbone_network.path_interfaces:
+            return nodes
+            
+        # 获取该骨干路径的所有接口节点
+        interface_ids = self.backbone_network.path_interfaces[backbone_id]
+        
+        for i, point in enumerate(path):
+            for interface_id in interface_ids:
+                interface_info = self.backbone_network.backbone_interfaces.get(interface_id)
+                if interface_info and self._is_same_position(point, interface_info['position']):
+                    nodes.append({
+                        'node_id': interface_id,
+                        'arrival_time': i * 1.0,  # 简化：假设匀速
+                        'position': point
+                    })
+                    break
+                    
+        return nodes
+    
+    def _get_node_position(self, node_id: str) -> Tuple:
+        """获取节点位置"""
+        if self.backbone_network and node_id in self.backbone_network.backbone_interfaces:
+            return self.backbone_network.backbone_interfaces[node_id]['position']
+        return (0, 0)
+    
+    def _get_interface_position(self, interface_id: str) -> Tuple:
+        """获取接口位置"""
+        return self._get_node_position(interface_id)
+    
+    def _check_time_window_overlap(self, info1: Dict, info2: Dict) -> Optional[Tuple]:
+        """检查时间窗口重叠"""
+        start1 = info1.get('usage_start_time', 0)
+        end1 = info1.get('usage_end_time', 100)
+        start2 = info2.get('usage_start_time', 0)
+        end2 = info2.get('usage_end_time', 100)
+        
+        overlap_start = max(start1, start2)
+        overlap_end = min(end1, end2)
+        
+        if overlap_start < overlap_end:
+            return (overlap_start, overlap_end)
+        return None
+    
+    def _find_narrow_passage_location(self, path1: List[Tuple], path2: List[Tuple], 
+                                    time_window: Tuple) -> Tuple:
+        """找到狭窄通道冲突位置"""
+        # 简化：返回时间窗口中点对应的位置
+        mid_time = int((time_window[0] + time_window[1]) / 2)
+        
+        if mid_time < len(path1) and mid_time < len(path2):
+            pos1 = path1[mid_time]
+            pos2 = path2[mid_time]
+            return ((pos1[0] + pos2[0])/2, (pos1[1] + pos2[1])/2)
+            
+        return (0, 0)
+    
+    def _positions_conflict(self, pos1: Tuple, pos2: Tuple) -> bool:
+        """检查位置冲突"""
+        distance = math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+        return distance < self.safety_margin
+    
+    def _edge_conflict(self, pos1: Tuple, next_pos1: Tuple, 
+                      pos2: Tuple, next_pos2: Tuple) -> bool:
+        """检查边冲突（交叉路径）"""
+        return (self._positions_conflict(pos1, next_pos2) and 
+                self._positions_conflict(next_pos1, pos2))
+    
+    def _calculate_conflict_severity(self, pos1: Tuple, pos2: Tuple) -> float:
+        """计算冲突严重程度"""
+        distance = math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+        return max(0.1, 1.0 - (distance / self.safety_margin))
+    
+    def _is_same_position(self, pos1: Tuple, pos2: Tuple, tolerance: float = 2.0) -> bool:
+        """判断两个位置是否相同"""
+        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2) < tolerance
+
+
+class BackboneAwareConstraintManager(ConstraintManager):
+    """骨干路径感知的约束管理器"""
     
     def __init__(self):
         super().__init__()
-        self.env = None
-        self.backbone_network = None
-        self.traffic_manager = None
+        self.node_constraints = defaultdict(list)  # {node_id: [constraints]}
+        self.path_switch_constraints = defaultdict(set)  # {agent: {forbidden_paths}}
         
-        # 图形项容器
-        self.vehicle_items = {}
-        self.path_items = {}
-        self.backbone_path_items = {}
-        self.interface_items = {}
-        self.conflict_markers = {}
+    def add_constraint(self, constraint: ECBSConstraint):
+        """添加约束 - 增强版"""
+        super().add_constraint(constraint)
         
-        # 显示选项
-        self.show_paths = True
-        self.show_backbone = True
-        self.show_interfaces = True
-        self.show_conflicts = True
-        self.show_safety_rects = False
-        
-        # 更新控制
-        self.update_in_progress = False
-        
-        self.setSceneRect(0, 0, 500, 500)
-    
-    def set_environment(self, env):
-        """设置环境"""
-        self.env = env
-        if env:
-            self.setSceneRect(0, 0, env.width, env.height)
-        
-        self.clear()
-        self._reset_items()
-        
-        if env:
-            self.draw_environment()
-    
-    def _reset_items(self):
-        """重置图形项"""
-        # 清理冲突标记的定时器
-        for marker in self.conflict_markers.values():
-            marker.cleanup()
-        
-        self.vehicle_items.clear()
-        self.path_items.clear()
-        self.backbone_path_items.clear()
-        self.interface_items.clear()
-        self.conflict_markers.clear()
-    
-    def draw_environment(self):
-        """绘制环境"""
-        if not self.env:
-            return
-        
-        # 背景
-        bg = QGraphicsRectItem(0, 0, self.env.width, self.env.height)
-        bg.setBrush(QBrush(COLORS['bg']))
-        bg.setPen(QPen(Qt.NoPen))
-        bg.setZValue(-100)
-        self.addItem(bg)
-        
-        # 网格线（可选）
-        self._draw_grid()
-        
-        # 障碍物
-        self._draw_obstacles()
-        
-        # 特殊点
-        self._draw_special_points()
-        
-        # 车辆
-        self.draw_vehicles()
-    
-    def _draw_grid(self):
-        """绘制网格线"""
-        grid_size = 50
-        pen = QPen(COLORS['border'], 0.5, Qt.DotLine)
-        
-        # 垂直线
-        for x in range(0, int(self.env.width) + 1, grid_size):
-            line = QGraphicsLineItem(x, 0, x, self.env.height)
-            line.setPen(pen)
-            line.setZValue(-99)
-            self.addItem(line)
-        
-        # 水平线
-        for y in range(0, int(self.env.height) + 1, grid_size):
-            line = QGraphicsLineItem(0, y, self.env.width, y)
-            line.setPen(pen)
-            line.setZValue(-99)
-            self.addItem(line)
-    
-    def _draw_obstacles(self):
-        """绘制障碍物"""
-        for x, y in self.env.obstacle_points:
-            obstacle = QGraphicsRectItem(x, y, 1, 1)
-            obstacle.setBrush(QBrush(COLORS['surface']))
-            obstacle.setPen(QPen(COLORS['border'], 0.1))
-            obstacle.setZValue(-50)
-            self.addItem(obstacle)
-    
-    def _draw_special_points(self):
-        """绘制特殊点"""
-        # 装载点
-        for i, point in enumerate(self.env.loading_points):
-            self._draw_special_point(point[0], point[1], COLORS['success'], 
-                                   f"L{i+1}", 'circle', 8)
-        
-        # 卸载点
-        for i, point in enumerate(self.env.unloading_points):
-            self._draw_special_point(point[0], point[1], COLORS['warning'], 
-                                   f"U{i+1}", 'square', 8)
-        
-        # 停车区
-        if hasattr(self.env, 'parking_areas'):
-            for i, point in enumerate(self.env.parking_areas):
-                self._draw_special_point(point[0], point[1], COLORS['primary'], 
-                                       f"P{i+1}", 'diamond', 8)
-    
-    def _draw_special_point(self, x, y, color, label, shape='circle', size=6):
-        """绘制特殊点（改进版）"""
-        if shape == 'circle':
-            area = QGraphicsEllipseItem(x-size/2, y-size/2, size, size)
-        elif shape == 'square':
-            area = QGraphicsRectItem(x-size/2, y-size/2, size, size)
-        else:  # diamond
-            diamond = QPolygonF([
-                QPointF(x, y-size/2),
-                QPointF(x+size/2, y),
-                QPointF(x, y+size/2),
-                QPointF(x-size/2, y)
-            ])
-            area = QGraphicsPolygonItem(diamond)
-        
-        area.setBrush(QBrush(color.lighter(150)))
-        area.setPen(QPen(color, 1))
-        area.setZValue(-20)
-        self.addItem(area)
-        
-        # 标签
-        text = QGraphicsTextItem(label)
-        text.setPos(x-10, y-25)
-        text.setDefaultTextColor(color)
-        text.setFont(QFont("Arial", 1, QFont.Bold))
-        text.setZValue(-10)
-        self.addItem(text)
-    
-    def draw_vehicles(self):
-        """绘制车辆"""
-        if not self.env:
-            return
-        
-        # 清除现有车辆
-        for item in self.vehicle_items.values():
-            self.removeItem(item)
-        self.vehicle_items.clear()
-        
-        # 添加车辆
-        for vehicle_id, vehicle_data in self.env.vehicles.items():
-            vehicle_item = EnhancedVehicleItem(vehicle_id, vehicle_data)
-            vehicle_item.set_safety_rect_visible(self.show_safety_rects)
-            self.addItem(vehicle_item)
-            self.vehicle_items[vehicle_id] = vehicle_item
+        # 处理节点约束
+        if isinstance(constraint, BackboneNodeConstraint):
+            self.node_constraints[constraint.node_id].append(constraint)
             
-            # 绘制路径
-            if self.show_paths and hasattr(vehicle_data, 'path') and vehicle_data.path:
-                self._draw_vehicle_path(vehicle_id, vehicle_data.path)
+        # 处理路径切换约束
+        if constraint.constraint_type == ConstraintType.PATH_SWITCH:
+            if constraint.agent and constraint.backbone_id:
+                self.path_switch_constraints[constraint.agent].add(constraint.backbone_id)
+                
+    def violates_constraint(self, agent: str, path: List[Tuple], 
+                          backbone_info: Dict = None) -> bool:
+        """检查路径是否违反约束 - 增强版"""
+        # 先检查基础约束
+        if super().violates_constraint(agent, path, backbone_info):
+            return True
+            
+        # 检查节点约束
+        if backbone_info and self._violates_node_constraints(agent, path, backbone_info):
+            return True
+            
+        # 检查路径切换约束
+        if backbone_info and self._violates_path_switch_constraints(agent, backbone_info):
+            return True
+            
+        return False
     
-    def _draw_vehicle_path(self, vehicle_id: str, path: List[Tuple]):
-        """绘制车辆路径"""
-        if not path or len(path) < 2:
-            return
+    def _violates_node_constraints(self, agent: str, path: List[Tuple], 
+                                  backbone_info: Dict) -> bool:
+        """检查是否违反节点约束"""
+        # 获取路径上的所有节点
+        path_nodes = self._extract_path_nodes(path, backbone_info)
         
-        # 移除旧路径
-        if vehicle_id in self.path_items:
-            self.removeItem(self.path_items[vehicle_id])
-        
-        painter_path = QPainterPath()
-        painter_path.moveTo(path[0][0], path[0][1])
-        
-        for point in path[1:]:
-            painter_path.lineTo(point[0], point[1])
-        
-        path_item = QGraphicsPathItem(painter_path)
-        pen = QPen(COLORS['primary'], 1, Qt.DashLine)
-        pen.setCapStyle(Qt.RoundCap)
-        path_item.setPen(pen)
-        path_item.setZValue(0)
-        
-        self.addItem(path_item)
-        self.path_items[vehicle_id] = path_item
+        for node_info in path_nodes:
+            node_id = node_info['node_id']
+            arrival_time = node_info['arrival_time']
+            
+            # 检查该节点的所有约束
+            for constraint in self.node_constraints.get(node_id, []):
+                if constraint.agent == agent:
+                    continue  # 跳过自己的约束
+                    
+                # 检查时间窗口冲突
+                if (constraint.time_window[0] <= arrival_time <= constraint.time_window[1]):
+                    return True
+                    
+        return False
     
-    def update_vehicles(self):
-        """更新车辆（防止递归）"""
-        if self.update_in_progress or not self.env:
-            return
+    def _violates_path_switch_constraints(self, agent: str, backbone_info: Dict) -> bool:
+        """检查是否违反路径切换约束"""
+        backbone_id = backbone_info.get('backbone_id')
         
-        self.update_in_progress = True
+        if backbone_id and agent in self.path_switch_constraints:
+            forbidden_paths = self.path_switch_constraints[agent]
+            return backbone_id in forbidden_paths
+            
+        return False
+    
+    def _extract_path_nodes(self, path: List[Tuple], backbone_info: Dict) -> List[Dict]:
+        """提取路径上的节点信息"""
+        # 简化实现
+        nodes = []
+        backbone_id = backbone_info.get('backbone_id')
+        
+        if backbone_id:
+            # 这里应该调用backbone_network的方法获取节点信息
+            # 简化处理
+            for i in range(0, len(path), 10):  # 每10个点作为一个节点
+                nodes.append({
+                    'node_id': f"{backbone_id}_node_{i}",
+                    'arrival_time': i * 1.0,
+                    'position': path[i]
+                })
+                
+        return nodes
+
+
+class BackboneAwareECBSSolver(ECBSSolver):
+    """骨干路径感知的ECBS求解器"""
+    
+    def __init__(self, env, path_planner, backbone_network=None, **kwargs):
+        super().__init__(env, path_planner, backbone_network, **kwargs)
+        
+        # 增强组件
+        self.constraint_manager = BackboneAwareConstraintManager()
+        self.conflict_detector = EnhancedConflictDetector(env, backbone_network)
+        self.node_time_manager = NodeTimeWindowManager(backbone_network)
+        self.path_switcher = BackbonePathSwitcher(backbone_network, path_planner)
+        self.parking_decision_maker = IntelligentParkingDecisionMaker(env, None)
+        
+        # 骨干路径缓存
+        self.backbone_alternatives = {}  # {(start_type, start_id, goal_type, goal_id): [path_ids]}
+        
+        # 增强统计
+        self.enhanced_stats = {
+            'path_switches': 0,
+            'parking_decisions': 0,
+            'node_conflicts_resolved': 0,
+            'narrow_passage_handled': 0
+        }
+        
+    def solve_with_backbone_awareness(self, agent_requests: Dict[str, Dict], 
+                                    backbone_allocations: Dict[str, str] = None) -> Dict[str, Any]:
+        """骨干路径感知的求解方法"""
+        solve_start = time.time()
+        
+        # 1. 预处理：为每个车辆找出所有可用骨干路径
+        self._precompute_backbone_alternatives(agent_requests)
+        
+        # 2. 初始化节点时间窗口
+        self._initialize_node_time_windows()
+        
+        # 3. 执行增强的ECBS搜索
+        result = self._enhanced_ecbs_search(agent_requests, backbone_allocations)
+        
+        # 4. 记录统计
+        result['enhanced_stats'] = self.enhanced_stats.copy()
+        result['solve_time'] = time.time() - solve_start
+        
+        return result
+    
+    def _precompute_backbone_alternatives(self, agent_requests: Dict[str, Dict]):
+        """预计算骨干路径备选方案"""
+        if not self.backbone_network:
+            return
+            
+        for agent_id, request in agent_requests.items():
+            goal = request.get('goal')
+            
+            # 解析目标类型和ID
+            goal_type, goal_id = self._parse_goal_info(goal)
+            
+            if goal_type and goal_id is not None:
+                # 查找所有可达该目标的骨干路径
+                alternatives = []
+                
+                for path_id, path_data in self.backbone_network.bidirectional_paths.items():
+                    if ((path_data.point_a['type'] == goal_type and path_data.point_a['id'] == goal_id) or
+                        (path_data.point_b['type'] == goal_type and path_data.point_b['id'] == goal_id)):
+                        alternatives.append(path_id)
+                        
+                key = (None, None, goal_type, goal_id)  # 简化键
+                self.backbone_alternatives[key] = alternatives
+                
+    def _initialize_node_time_windows(self):
+        """初始化节点时间窗口"""
+        self.node_time_manager.node_reservations.clear()
+        
+    def _enhanced_ecbs_search(self, agent_requests: Dict[str, Dict],
+                            backbone_allocations: Dict[str, str] = None) -> Dict[str, Any]:
+        """增强的ECBS搜索"""
+        # 使用父类的solve方法，但重写关键方法
+        return self.solve(agent_requests, backbone_allocations)
+    
+    def _generate_child_nodes(self, parent_node: ECBSNode, conflict: ECBSConflict,
+                            agent_requests: Dict[str, Dict],
+                            backbone_allocations: Dict[str, str] = None) -> List[ECBSNode]:
+        """生成子节点 - 增强版支持多种冲突解决策略"""
+        child_nodes = []
+        
+        # 分析冲突类型
+        conflict_analysis = self._analyze_conflict_type(conflict, parent_node)
+        
+        # 根据冲突类型采用不同策略
+        if conflict.conflict_type in [ConflictType.NODE_OCCUPATION, ConflictType.ACCESS_POINT]:
+            # 节点冲突 - 优先尝试路径切换
+            child_nodes.extend(self._try_path_switch_strategy(
+                parent_node, conflict, agent_requests, backbone_allocations
+            ))
+            
+        elif conflict.conflict_type == ConflictType.NARROW_PASSAGE:
+            # 狭窄通道 - 考虑停车等待
+            child_nodes.extend(self._try_parking_strategy(
+                parent_node, conflict, agent_requests, conflict_analysis
+            ))
+            
+        # 如果特殊策略失败或不适用，使用传统约束方法
+        if not child_nodes:
+            child_nodes.extend(self._try_traditional_constraints(
+                parent_node, conflict, agent_requests, backbone_allocations
+            ))
+            
+        return child_nodes
+    
+    def _analyze_conflict_type(self, conflict: ECBSConflict, 
+                              parent_node: ECBSNode) -> Dict[str, Any]:
+        """分析冲突类型和上下文"""
+        analysis = {
+            'type': conflict.conflict_type.value,
+            'severity': conflict.severity,
+            'location': conflict.location,
+            'time': conflict.time,
+            'agents_involved': conflict.agents
+        }
+        
+        # 获取涉及车辆的优先级
+        priorities = {}
+        for agent in conflict.agents:
+            # 从parent_node的solution中获取优先级信息
+            priorities[agent] = 0.5  # 默认优先级
+            
+        analysis['priorities'] = priorities
+        
+        # 检查是否为不可避免的冲突
+        if conflict.conflict_type == ConflictType.NARROW_PASSAGE:
+            # 检查是否所有备选路径都被占用
+            all_paths_blocked = self._check_all_paths_blocked(conflict, parent_node)
+            analysis['unavoidable'] = all_paths_blocked
+            
+        return analysis
+    
+    def _try_path_switch_strategy(self, parent_node: ECBSNode, conflict: ECBSConflict,
+                                agent_requests: Dict[str, Dict],
+                                backbone_allocations: Dict[str, str]) -> List[ECBSNode]:
+        """尝试路径切换策略"""
+        child_nodes = []
+        
+        for agent in conflict.agents:
+            # 查找替代骨干路径
+            current_path_id = backbone_allocations.get(agent) if backbone_allocations else None
+            used_paths = {current_path_id} if current_path_id else set()
+            
+            # 添加已尝试过的路径
+            if agent in parent_node.path_switches:
+                used_paths.add(parent_node.path_switches[agent])
+                
+            request = agent_requests[agent]
+            goal_info = self._extract_goal_info(request)
+            
+            alternative = self.path_switcher.find_alternative_backbone_path(
+                agent, request['start'], goal_info, 
+                {'conflict_type': conflict.conflict_type, 'location': conflict.location},
+                used_paths
+            )
+            
+            if alternative:
+                # 创建新节点，使用替代路径
+                child_node = self._create_path_switch_node(
+                    parent_node, agent, alternative, agent_requests, backbone_allocations
+                )
+                
+                if child_node:
+                    child_nodes.append(child_node)
+                    self.enhanced_stats['path_switches'] += 1
+                    
+        return child_nodes
+    
+    def _try_parking_strategy(self, parent_node: ECBSNode, conflict: ECBSConflict,
+                            agent_requests: Dict[str, Dict],
+                            conflict_analysis: Dict) -> List[ECBSNode]:
+        """尝试停车等待策略"""
+        child_nodes = []
+        
+        # 决定哪些车辆应该停车
+        for agent in conflict.agents:
+            should_park, parking_decision = self.parking_decision_maker.should_park_and_wait(
+                agent, conflict_analysis
+            )
+            
+            if should_park and parking_decision:
+                # 创建停车节点
+                child_node = self._create_parking_node(
+                    parent_node, agent, parking_decision, agent_requests
+                )
+                
+                if child_node:
+                    # 模拟停车结果
+                    simulation = self.parking_decision_maker.simulate_parking_outcome(
+                        parking_decision
+                    )
+                    
+                    # 如果预测冲突会解决，添加节点
+                    if simulation['conflicts_resolved'] or simulation['confidence'] > 0.7:
+                        child_nodes.append(child_node)
+                        self.enhanced_stats['parking_decisions'] += 1
+                        
+        return child_nodes
+    
+    def _try_traditional_constraints(self, parent_node: ECBSNode, conflict: ECBSConflict,
+                                   agent_requests: Dict[str, Dict],
+                                   backbone_allocations: Dict[str, str]) -> List[ECBSNode]:
+        """使用传统约束方法"""
+        child_nodes = []
+        
+        for agent in conflict.agents:
+            child_node = ECBSNode()
+            child_node.constraints = parent_node.constraints.copy()
+            child_node.parking_decisions = parent_node.parking_decisions.copy()
+            child_node.path_switches = parent_node.path_switches.copy()
+            
+            # 生成约束
+            new_constraint = self._generate_enhanced_constraint(conflict, agent)
+            if new_constraint:
+                child_node.constraints.add(new_constraint)
+                self.constraint_manager.add_constraint(new_constraint)
+                self.stats['constraints_generated'] += 1
+                
+                # 重新规划
+                child_node.solution = parent_node.solution.copy()
+                
+                new_path = self._replan_with_enhanced_constraints(
+                    agent, agent_requests[agent], child_node.constraints,
+                    backbone_allocations, child_node.parking_decisions
+                )
+                
+                if new_path:
+                    child_node.solution[agent] = new_path
+                    child_node.cost = sum(len(path) for path in child_node.solution.values())
+                    
+                    # 检测新冲突
+                    backbone_info = self._extract_backbone_info(child_node.solution, backbone_allocations)
+                    child_node.conflicts = self.conflict_detector.detect_all_conflicts(
+                        child_node.solution, backbone_info
+                    )
+                    child_node.h_value = len(child_node.conflicts)
+                    child_node.f_value = child_node.cost + child_node.h_value
+                    
+                    child_nodes.append(child_node)
+                    
+        return child_nodes
+    
+    def _create_path_switch_node(self, parent_node: ECBSNode, agent: str,
+                               alternative: Dict, agent_requests: Dict[str, Dict],
+                               backbone_allocations: Dict[str, str]) -> Optional[ECBSNode]:
+        """创建路径切换节点"""
+        child_node = ECBSNode()
+        child_node.constraints = parent_node.constraints.copy()
+        child_node.parking_decisions = parent_node.parking_decisions.copy()
+        child_node.path_switches = parent_node.path_switches.copy()
+        
+        # 记录路径切换
+        child_node.path_switches[agent] = alternative['path_id']
+        
+        # 添加路径切换约束，防止切换回原路径
+        if agent in backbone_allocations:
+            switch_constraint = ECBSConstraint(
+                constraint_type=ConstraintType.PATH_SWITCH,
+                agent=agent,
+                backbone_id=backbone_allocations[agent]
+            )
+            child_node.constraints.add(switch_constraint)
+            
+        # 使用新路径重新规划
+        request = agent_requests[agent]
+        new_backbone_allocations = backbone_allocations.copy() if backbone_allocations else {}
+        new_backbone_allocations[agent] = alternative['path_id']
+        
+        # 规划新路径
+        new_path = self._plan_with_specific_backbone(
+            agent, request, alternative['path_id'], alternative['access_point']
+        )
+        
+        if new_path:
+            child_node.solution = parent_node.solution.copy()
+            child_node.solution[agent] = new_path
+            child_node.cost = sum(len(path) for path in child_node.solution.values())
+            
+            # 检测新冲突
+            backbone_info = self._extract_backbone_info(child_node.solution, new_backbone_allocations)
+            child_node.conflicts = self.conflict_detector.detect_all_conflicts(
+                child_node.solution, backbone_info
+            )
+            child_node.h_value = len(child_node.conflicts)
+            child_node.f_value = child_node.cost + child_node.h_value
+            
+            return child_node
+            
+        return None
+    
+    def _create_parking_node(self, parent_node: ECBSNode, agent: str,
+                           parking_decision: ParkingDecision,
+                           agent_requests: Dict[str, Dict]) -> Optional[ECBSNode]:
+        """创建停车节点"""
+        child_node = ECBSNode()
+        child_node.constraints = parent_node.constraints.copy()
+        child_node.parking_decisions = parent_node.parking_decisions.copy()
+        child_node.path_switches = parent_node.path_switches.copy()
+        
+        # 添加停车决策
+        child_node.parking_decisions[agent] = parking_decision
+        
+        # 生成包含停车的路径
+        request = agent_requests[agent]
+        parking_path = self._generate_parking_path(
+            agent, request['start'], request['goal'], parking_decision
+        )
+        
+        if parking_path:
+            child_node.solution = parent_node.solution.copy()
+            child_node.solution[agent] = parking_path
+            child_node.cost = sum(len(path) for path in child_node.solution.values())
+            
+            # 添加停车成本（鼓励尽量少停车）
+            child_node.cost += parking_decision.parking_duration * 0.5
+            
+            # 检测新冲突
+            backbone_info = self._extract_backbone_info(child_node.solution, None)
+            child_node.conflicts = self.conflict_detector.detect_all_conflicts(
+                child_node.solution, backbone_info
+            )
+            
+            # 降低停车后的启发式值（因为停车可以解决很多冲突）
+            child_node.h_value = len(child_node.conflicts) * 0.7
+            child_node.f_value = child_node.cost + child_node.h_value
+            
+            return child_node
+            
+        return None
+    
+    def _generate_enhanced_constraint(self, conflict: ECBSConflict, 
+                                    agent: str) -> Optional[ECBSConstraint]:
+        """生成增强约束"""
+        if conflict.conflict_type == ConflictType.NODE_OCCUPATION:
+            # 节点占用约束
+            return BackboneNodeConstraint(
+                node_id=conflict.node_id,
+                backbone_path_id=conflict.backbone_id,
+                time_window=(conflict.time - 2, conflict.time + 2),
+                agent=agent
+            )
+            
+        elif conflict.conflict_type == ConflictType.NARROW_PASSAGE:
+            # 骨干路径时间窗口约束
+            return ECBSConstraint(
+                constraint_type=ConstraintType.BACKBONE,
+                agent=agent,
+                backbone_id=conflict.backbone_id,
+                time_window=(conflict.time - 5, conflict.time + 5)
+            )
+            
+        else:
+            # 使用父类的约束生成
+            return self._generate_constraint_for_conflict(conflict, agent)
+    
+    def _replan_with_enhanced_constraints(self, agent: str, request: Dict,
+                                        constraints: Set[ECBSConstraint],
+                                        backbone_allocations: Dict[str, str],
+                                        parking_decisions: Dict[str, ParkingDecision]) -> Optional[List[Tuple]]:
+        """在增强约束下重新规划"""
+        # 检查是否有停车决策
+        if agent in parking_decisions:
+            parking_decision = parking_decisions[agent]
+            return self._generate_parking_path(
+                agent, request['start'], request['goal'], parking_decision
+            )
+            
+        # 尝试使用备选骨干路径
+        goal_type, goal_id = self._parse_goal_info(request['goal'])
+        key = (None, None, goal_type, goal_id)
+        
+        if key in self.backbone_alternatives:
+            alternatives = self.backbone_alternatives[key]
+            current_backbone = backbone_allocations.get(agent) if backbone_allocations else None
+            
+            # 尝试每个备选路径
+            for alt_backbone_id in alternatives:
+                if alt_backbone_id == current_backbone:
+                    continue
+                    
+                # 检查路径切换约束
+                if self._violates_path_switch_constraint(agent, alt_backbone_id, constraints):
+                    continue
+                    
+                # 尝试使用该骨干路径规划
+                path = self._plan_with_specific_backbone(
+                    agent, request, alt_backbone_id, None
+                )
+                
+                if path:
+                    # 检查是否违反约束
+                    backbone_info = {'backbone_id': alt_backbone_id}
+                    if not self.constraint_manager.violates_constraint(agent, path, backbone_info):
+                        return path
+                        
+        # 如果都失败，使用父类方法
+        return super()._replan_with_constraints(agent, request, constraints, backbone_allocations)
+    
+    def _plan_with_specific_backbone(self, agent: str, request: Dict,
+                                   backbone_id: str, access_point: Optional[Dict]) -> Optional[List[Tuple]]:
+        """使用特定骨干路径规划"""
+        if not self.path_planner or not self.backbone_network:
+            return None
+            
         try:
-            for vehicle_id, vehicle_data in self.env.vehicles.items():
-                if vehicle_id in self.vehicle_items:
-                    self.vehicle_items[vehicle_id].update_data(vehicle_data)
+            # 这里应该调用path_planner的特定接口
+            # 简化实现：直接使用path_planner
+            result = self.path_planner.plan_path(
+                vehicle_id=agent,
+                start=request['start'],
+                goal=request['goal'],
+                use_backbone=True,
+                context='ecbs_coordination'
+            )
+            
+            if result:
+                if isinstance(result, tuple):
+                    return result[0]
                 else:
-                    vehicle_item = EnhancedVehicleItem(vehicle_id, vehicle_data)
-                    vehicle_item.set_safety_rect_visible(self.show_safety_rects)
-                    self.addItem(vehicle_item)
-                    self.vehicle_items[vehicle_id] = vehicle_item
-                
-                # 更新路径
-                if self.show_paths:
-                    if hasattr(vehicle_data, 'path') and vehicle_data.path:
-                        self._draw_vehicle_path(vehicle_id, vehicle_data.path)
-                    elif vehicle_id in self.path_items:
-                        self.removeItem(self.path_items[vehicle_id])
-                        del self.path_items[vehicle_id]
-        finally:
-            self.update_in_progress = False
-    
-    def update_backbone_visualization(self):
-        """更新骨干网络可视化"""
-        # 清除旧的
-        for item in self.backbone_path_items.values():
-            self.removeItem(item)
-        self.backbone_path_items.clear()
-        
-        for item in self.interface_items.values():
-            self.removeItem(item)
-        self.interface_items.clear()
-        
-        if not self.backbone_network or not self.show_backbone:
-            return
-        
-        # 绘制骨干路径
-        for path_id, path_data in self.backbone_network.bidirectional_paths.items():
-            if not path_data.forward_path or len(path_data.forward_path) < 2:
-                continue
+                    return result
+                    
+        except Exception as e:
+            print(f"规划失败 {agent}: {e}")
             
-            # 创建路径项
-            path_item = BackbonePathItem(path_id, path_data)
-            self.addItem(path_item)
-            self.backbone_path_items[path_id] = path_item
+        return None
+    
+    def _generate_parking_path(self, agent: str, start: Tuple, goal: Tuple,
+                             parking_decision: ParkingDecision) -> Optional[List[Tuple]]:
+        """生成包含停车的路径"""
+        if not self.path_planner:
+            return None
             
-            # 绘制接口节点
-            if self.show_interfaces:
-                self._draw_path_interfaces(path_id, path_data)
-    
-    def _draw_path_interfaces(self, path_id: str, path_data: Any):
-        """绘制路径的接口节点"""
-        if path_id not in self.backbone_network.path_interfaces:
-            return
-        
-        interfaces = self.backbone_network.path_interfaces[path_id]
-        
-        for i, interface_id in enumerate(interfaces):
-            if interface_id in self.backbone_network.backbone_interfaces:
-                interface_info = self.backbone_network.backbone_interfaces[interface_id]
-                position = interface_info['position']
-                
-                interface_item = BackboneInterfaceItem(
-                    interface_id, position, path_id, i
-                )
-                self.addItem(interface_item)
-                self.interface_items[interface_id] = interface_item
-    
-    def update_conflicts(self):
-        """更新冲突显示"""
-        # 清除旧冲突
-        for marker in self.conflict_markers.values():
-            marker.cleanup()
-            self.removeItem(marker)
-        self.conflict_markers.clear()
-        
-        if not self.show_conflicts or not self.traffic_manager:
-            return
-        
-        # 获取冲突
         try:
-            conflicts = self.traffic_manager.detect_all_conflicts()
+            # 1. 规划到停车位置的路径
+            to_parking = self.path_planner.plan_path(
+                vehicle_id=agent,
+                start=start,
+                goal=parking_decision.parking_position,
+                use_backbone=False,
+                context='parking'
+            )
             
-            for i, conflict in enumerate(conflicts[:20]):  # 最多显示20个
-                conflict_id = f"conflict_{i}"
+            if not to_parking:
+                return None
                 
-                # 创建冲突标记
-                marker = ConflictMarker(
-                    conflict_id,
-                    conflict.location,
-                    getattr(conflict, 'severity', 1.0)
-                )
+            if isinstance(to_parking, tuple):
+                to_parking = to_parking[0]
                 
-                self.addItem(marker)
-                self.conflict_markers[conflict_id] = marker
+            # 2. 停车等待（通过重复位置表示）
+            parking_steps = int(parking_decision.parking_duration)
+            wait_path = [parking_decision.parking_position] * parking_steps
+            
+            # 3. 从停车位置到目标的路径
+            from_parking = self.path_planner.plan_path(
+                vehicle_id=agent,
+                start=parking_decision.parking_position,
+                goal=goal,
+                use_backbone=True,
+                context='resume'
+            )
+            
+            if not from_parking:
+                return None
+                
+            if isinstance(from_parking, tuple):
+                from_parking = from_parking[0]
+                
+            # 合并路径
+            complete_path = to_parking[:-1] + wait_path + from_parking
+            
+            return complete_path
+            
+        except Exception as e:
+            print(f"生成停车路径失败 {agent}: {e}")
+            return None
+    
+    def _check_all_paths_blocked(self, conflict: ECBSConflict, 
+                               parent_node: ECBSNode) -> bool:
+        """检查是否所有路径都被阻塞"""
+        # 简化实现
+        if conflict.conflict_type == ConflictType.NARROW_PASSAGE:
+            # 检查骨干路径的负载
+            if self.backbone_network and conflict.backbone_id:
+                path_data = self.backbone_network.bidirectional_paths.get(conflict.backbone_id)
+                if path_data and path_data.get_load_factor() > 0.8:
+                    return True
+                    
+        return False
+    
+    def _violates_path_switch_constraint(self, agent: str, backbone_id: str,
+                                       constraints: Set[ECBSConstraint]) -> bool:
+        """检查是否违反路径切换约束"""
+        for constraint in constraints:
+            if (constraint.constraint_type == ConstraintType.PATH_SWITCH and
+                constraint.agent == agent and constraint.backbone_id == backbone_id):
+                return True
+        return False
+    
+    def _parse_goal_info(self, goal: Any) -> Tuple[Optional[str], Optional[int]]:
+        """解析目标信息"""
+        # 这里需要根据实际的目标格式解析
+        # 简化实现
+        return ('unloading', 0)
+    
+    def _extract_goal_info(self, request: Dict) -> Dict:
+        """提取目标信息"""
+        goal_type, goal_id = self._parse_goal_info(request.get('goal'))
+        return {
+            'type': goal_type,
+            'id': goal_id,
+            'position': request.get('goal')
+        }
+
+
+class OptimizedTrafficManagerWithECBS:
+    """集成完整BA-ECBS的优化交通管理器"""
+    
+    def __init__(self, env, backbone_network=None, path_planner=None):
+        # 核心组件
+        self.env = env
+        self.backbone_network = backbone_network
+        self.path_planner = path_planner
+        
+        # 使用增强的ECBS求解器
+        self.ecbs_solver = BackboneAwareECBSSolver(env, path_planner, backbone_network)
+        
+        # 设置parking_decision_maker的traffic_manager引用
+        self.ecbs_solver.parking_decision_maker.traffic_manager = self
+        
+        # 原有组件
+        self.vehicle_predictions = {}
+        self.prediction_horizon = 30
+        self.active_paths = {}
+        self.path_reservations = {}
+        self.vehicle_priorities = {}
+        
+        # 增强的冲突消解器
+        self.use_enhanced_resolution = True
+        self.init_enhanced_resolver()
+        
+        # 车辆参数
+        self.vehicle_params = {
+            'length': 6.0,
+            'width': 3.0,
+            'safety_margin': 1.5
+        }
+        
+        # 检测参数
+        self.safety_distance = 8.0
+        self.time_discretization = 1.0
+        
+        # 线程锁
+        self.state_lock = threading.RLock()
+        
+        # 增强统计
+        self.stats = {
+            'total_conflicts': 0,
+            'resolved_conflicts': 0,
+            'ecbs_coordinations': 0,
+            'ecbs_success_rate': 0.0,
+            'average_solve_time': 0.0,
+            'constraint_violations': 0,
+            'backbone_conflicts': 0,
+            'priority_adjustments': 0,
+            'path_switches': 0,
+            'parking_maneuvers': 0,
+            'backbone_switches': 0,
+            'constraints_generated': 0
+        }
+        
+        print("初始化集成完整BA-ECBS的优化交通管理器")
+    
+    def init_enhanced_resolver(self):
+        """初始化增强冲突消解器"""
+        try:
+            from enhanced_conflict_resolver import EnhancedConflictResolver
+            self.enhanced_resolver = EnhancedConflictResolver(
+                self, self.backbone_network, self.path_planner
+            )
+            self.use_enhanced_resolution = True
+            print("✅ 增强冲突消解器已启用")
+        except ImportError:
+            self.enhanced_resolver = None
+            self.use_enhanced_resolution = False
+            print("⚠️ 增强冲突消解器不可用，使用BA-ECBS")
+    
+    def ecbs_coordinate_paths(self, vehicle_requests: Dict[str, Dict],
+                            backbone_allocations: Dict[str, str] = None,
+                            max_solve_time: float = 30.0) -> Dict[str, Any]:
+        """使用增强的BA-ECBS协调多车辆路径规划"""
+        coordination_start = time.time()
+        self.stats['ecbs_coordinations'] += 1
+        
+        try:
+            print(f"开始BA-ECBS多车辆协调: {len(vehicle_requests)} 个车辆")
+            
+            # 考虑车辆优先级
+            self._adjust_requests_by_priority(vehicle_requests)
+            
+            # 设置求解器参数
+            self.ecbs_solver.timeout = max_solve_time
+            
+            # 执行BA-ECBS求解
+            result = self.ecbs_solver.solve_with_backbone_awareness(
+                vehicle_requests, backbone_allocations
+            )
+            
+            if result.get('success', False):
+                # 注册协调后的路径
+                self._register_coordinated_paths(result)
+                
+                # 更新统计
+                self._update_ecbs_statistics(True, result)
+                
+                print(f"✅ BA-ECBS协调成功: 最终冲突{result.get('final_conflicts', 0)}个, "
+                      f"路径切换{result.get('enhanced_stats', {}).get('path_switches', 0)}次, "
+                      f"停车决策{result.get('enhanced_stats', {}).get('parking_decisions', 0)}个")
+                
+                return result
+            else:
+                self._update_ecbs_statistics(False, result)
+                print(f"❌ BA-ECBS协调失败: {result.get('error', 'Unknown error')}")
+                return result
                 
         except Exception as e:
-            print(f"更新冲突显示失败: {e}")
+            print(f"BA-ECBS协调异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'error': f'协调异常: {str(e)}'}
     
-    def highlight_vehicle_path(self, vehicle_id: str):
-        """高亮车辆路径"""
-        if vehicle_id in self.path_items:
-            path_item = self.path_items[vehicle_id]
-            pen = path_item.pen()
-            pen.setWidth(1)
-            pen.setColor(COLORS['warning'])
-            path_item.setPen(pen)
+    def _register_coordinated_paths(self, result: Dict):
+        """注册协调后的路径"""
+        paths = result.get('paths', {})
+        structures = result.get('structures', {})
+        parking_decisions = result.get('parking_decisions', {})
+        
+        for vehicle_id, path in paths.items():
+            # 注册路径
+            self.register_vehicle_path(
+                vehicle_id, path, time.time(), 
+                path_structure=structures.get(vehicle_id)
+            )
+            
+            # 处理停车决策
+            if vehicle_id in parking_decisions:
+                self._apply_parking_decision(vehicle_id, parking_decisions[vehicle_id])
+                
+            # 更新节点预约
+            if hasattr(self.ecbs_solver, 'node_time_manager'):
+                self.ecbs_solver.node_time_manager.reserve_node_sequence(
+                    path, vehicle_id, time.time()
+                )
+    
+    def _apply_parking_decision(self, vehicle_id: str, parking_decision: ParkingDecision):
+        """应用停车决策"""
+        # 记录停车信息
+        if not hasattr(self, 'parking_vehicles'):
+            self.parking_vehicles = {}
+            
+        self.parking_vehicles[vehicle_id] = {
+            'position': parking_decision.parking_position,
+            'duration': parking_decision.parking_duration,
+            'start_time': parking_decision.start_time,
+            'reason': parking_decision.reason,
+            'priority_vehicle': parking_decision.priority_vehicle_id
+        }
+        
+        print(f"车辆 {vehicle_id} 执行停车决策: {parking_decision.reason}")
+        
+        # 通知调度器
+        if hasattr(self, 'vehicle_scheduler') and self.vehicle_scheduler:
+            self.vehicle_scheduler.handle_parking_decision(vehicle_id, parking_decision.__dict__)
+    
+    def register_vehicle_path(self, vehicle_id: str, path: List, 
+                            start_time: float = 0, speed: float = 1.0,
+                            path_structure: Dict = None) -> bool:
+        """注册车辆路径 - 增强版"""
+        if not path or len(path) < 2:
+            return False
+        
+        with self.state_lock:
+            # 移除旧路径
+            self.release_vehicle_path(vehicle_id)
+            
+            # 获取车辆优先级
+            priority = self.get_vehicle_priority(vehicle_id)
+            
+            # 注册新路径
+            path_info = {
+                'path': path,
+                'start_time': start_time,
+                'speed': speed,
+                'priority': priority,
+                'registered_time': time.time(),
+                'coordination_method': 'ba_ecbs',
+                'path_structure': path_structure or {}
+            }
+            
+            self.active_paths[vehicle_id] = path_info
+            
+            # 更新骨干网络负载
+            if path_structure and 'backbone_id' in path_structure:
+                backbone_id = path_structure['backbone_id']
+                if self.backbone_network and backbone_id in self.backbone_network.bidirectional_paths:
+                    self.backbone_network.bidirectional_paths[backbone_id].add_vehicle(vehicle_id)
+                    
+            return True
+    
+    def detect_all_conflicts(self) -> List:
+        """检测所有冲突 - 使用增强检测器"""
+        if not self.active_paths:
+            return []
+        
+        # 准备数据
+        solution = {vid: info['path'] for vid, info in self.active_paths.items()}
+        backbone_info = {}
+        
+        for vid, info in self.active_paths.items():
+            structure = info.get('path_structure', {})
+            if 'backbone_id' in structure:
+                backbone_info[vid] = {
+                    'backbone_id': structure['backbone_id'],
+                    'usage_start_time': 0,
+                    'usage_end_time': len(info['path'])
+                }
+                
+        # 使用增强检测器
+        conflicts = self.ecbs_solver.conflict_detector.detect_all_conflicts(
+            solution, backbone_info
+        )
+        
+        # 更新统计
+        self.stats['total_conflicts'] += len(conflicts)
+        
+        # 统计骨干路径相关冲突
+        backbone_conflicts = [c for c in conflicts if c.conflict_type in [
+            ConflictType.NODE_OCCUPATION, ConflictType.NARROW_PASSAGE, 
+            ConflictType.ACCESS_POINT, ConflictType.BACKBONE_CONGESTION
+        ]]
+        self.stats['backbone_conflicts'] += len(backbone_conflicts)
+        
+        # 转换为兼容格式
+        return self._convert_conflicts_to_compatible_format(conflicts)
+    
+    def _convert_conflicts_to_compatible_format(self, conflicts: List[ECBSConflict]) -> List:
+        """转换冲突格式以保持兼容性"""
+        converted_conflicts = []
+        
+        for conflict in conflicts:
+            converted = type('Conflict', (), {
+                'conflict_id': conflict.conflict_id,
+                'agents': conflict.agents,
+                'location': conflict.location,
+                'time_step': conflict.time,
+                'conflict_type': conflict.conflict_type,
+                'severity': conflict.severity,
+                'backbone_id': getattr(conflict, 'backbone_id', None),
+                'node_id': getattr(conflict, 'node_id', None)
+            })()
+            converted_conflicts.append(converted)
+            
+        return converted_conflicts
+    
+    def resolve_conflicts(self, conflicts: List) -> Dict[str, List]:
+        """解决冲突 - 优先使用BA-ECBS"""
+        if not conflicts:
+            return {vid: info['path'] for vid, info in self.active_paths.items()}
+        
+        print(f"检测到 {len(conflicts)} 个冲突，开始BA-ECBS冲突消解...")
+        
+        # 准备车辆请求
+        vehicle_requests = {}
+        backbone_allocations = {}
+        
+        involved_vehicles = set()
+        for conflict in conflicts:
+            if hasattr(conflict, 'agents'):
+                involved_vehicles.update(conflict.agents)
+                
+        for vehicle_id in involved_vehicles:
+            if vehicle_id in self.active_paths:
+                path_info = self.active_paths[vehicle_id]
+                path = path_info['path']
+                
+                vehicle_requests[vehicle_id] = {
+                    'start': path[0],
+                    'goal': path[-1],
+                    'priority': self.get_vehicle_priority(vehicle_id)
+                }
+                
+                # 提取骨干分配信息
+                structure = path_info.get('path_structure', {})
+                if 'backbone_id' in structure:
+                    backbone_allocations[vehicle_id] = structure['backbone_id']
+                    
+        # 执行BA-ECBS协调
+        coordination_result = self.ecbs_coordinate_paths(
+            vehicle_requests, backbone_allocations, max_solve_time=30.0
+        )
+        
+        if coordination_result.get('success', False):
+            # 获取协调后的路径
+            coordinated_paths = coordination_result.get('paths', {})
+            current_paths = {vid: info['path'] for vid, info in self.active_paths.items()}
+            
+            # 更新路径
+            for vehicle_id, new_path in coordinated_paths.items():
+                current_paths[vehicle_id] = new_path
+                
+            self.stats['resolved_conflicts'] += len(conflicts)
+            
+            # 更新增强统计
+            enhanced_stats = coordination_result.get('enhanced_stats', {})
+            self.stats['path_switches'] += enhanced_stats.get('path_switches', 0)
+            self.stats['parking_maneuvers'] += enhanced_stats.get('parking_decisions', 0)
+            
+            print(f"✅ BA-ECBS成功解决 {len(conflicts)} 个冲突")
+            return current_paths
+        else:
+            print(f"❌ BA-ECBS冲突解决失败，保持原路径")
+            return {vid: info['path'] for vid, info in self.active_paths.items()}
+    
+    def release_vehicle_path(self, vehicle_id: str) -> bool:
+        """释放车辆路径 - 增强版"""
+        with self.state_lock:
+            if vehicle_id not in self.active_paths:
+                return False
+            
+            path_info = self.active_paths[vehicle_id]
+            
+            # 释放骨干网络资源
+            structure = path_info.get('path_structure', {})
+            if 'backbone_id' in structure:
+                backbone_id = structure['backbone_id']
+                if self.backbone_network and backbone_id in self.backbone_network.bidirectional_paths:
+                    self.backbone_network.bidirectional_paths[backbone_id].remove_vehicle(vehicle_id)
+                    
+            # 释放节点预约
+            if hasattr(self.ecbs_solver, 'node_time_manager'):
+                self.ecbs_solver.node_time_manager.release_node_reservations(vehicle_id)
+                
+            del self.active_paths[vehicle_id]
+            
+            if vehicle_id in self.vehicle_predictions:
+                del self.vehicle_predictions[vehicle_id]
+                
+            return True
+    
+    def update(self, time_delta: float):
+        """更新状态"""
+        # 更新停车车辆
+        if hasattr(self, 'parking_vehicles'):
+            current_time = time.time()
+            completed = []
+            
+            for vehicle_id, parking_info in self.parking_vehicles.items():
+                if current_time - parking_info['start_time'] > parking_info['duration']:
+                    completed.append(vehicle_id)
+                    print(f"车辆 {vehicle_id} 完成停车等待")
+                    
+            for vehicle_id in completed:
+                del self.parking_vehicles[vehicle_id]
+                
+        # 清理过期的节点预约
+        if hasattr(self.ecbs_solver, 'node_time_manager'):
+            # 这里可以添加清理逻辑
+            pass
+    
+    def get_statistics(self) -> Dict:
+        """获取增强统计信息"""
+        base_stats = self.stats.copy()
+        
+        # 添加BA-ECBS特定统计
+        if hasattr(self.ecbs_solver, 'enhanced_stats'):
+            base_stats['ba_ecbs'] = self.ecbs_solver.enhanced_stats.copy()
+            
+        # 添加当前状态
+        base_stats['active_parking_vehicles'] = len(getattr(self, 'parking_vehicles', {}))
+        base_stats['active_paths'] = len(self.active_paths)
+        
+        return base_stats
+    
+    # ========== 保留原有接口方法 ==========
+    
+    def set_vehicle_priority(self, vehicle_id: str, priority: float) -> bool:
+        """设置车辆优先级"""
+        try:
+            priority = max(0.0, min(1.0, priority))
+            
+            with self.state_lock:
+                old_priority = self.vehicle_priorities.get(vehicle_id, 0.5)
+                self.vehicle_priorities[vehicle_id] = priority
+                
+                if abs(old_priority - priority) > 0.1:
+                    self.stats['priority_adjustments'] += 1
+                    
+            return True
+            
+        except Exception as e:
+            print(f"设置车辆优先级失败 {vehicle_id}: {e}")
+            return False
+    
+    def get_vehicle_priority(self, vehicle_id: str) -> float:
+        """获取车辆优先级"""
+        return self.vehicle_priorities.get(vehicle_id, 0.5)
+    
+    def _adjust_requests_by_priority(self, vehicle_requests: Dict[str, Dict]):
+        """根据车辆优先级调整请求"""
+        for vehicle_id, request in vehicle_requests.items():
+            vehicle_priority = self.get_vehicle_priority(vehicle_id)
+            
+            if 'priority' not in request:
+                request['priority'] = vehicle_priority
+            else:
+                request['priority'] = (request['priority'] * 0.7 + vehicle_priority * 0.3)
+    
+    def _update_ecbs_statistics(self, success: bool, result: Dict):
+        """更新ECBS统计信息"""
+        solve_time = result.get('solve_time', 0.0)
+        
+        # 更新成功率
+        current_rate = self.stats['ecbs_success_rate']
+        total_coords = self.stats['ecbs_coordinations']
+        
+        if success:
+            new_rate = (current_rate * (total_coords - 1) + 1.0) / total_coords
+        else:
+            new_rate = (current_rate * (total_coords - 1)) / total_coords
+            
+        self.stats['ecbs_success_rate'] = new_rate
+        
+        # 更新平均求解时间
+        current_avg = self.stats['average_solve_time']
+        new_avg = (current_avg * (total_coords - 1) + solve_time) / total_coords
+        self.stats['average_solve_time'] = new_avg
+        
+        # 更新其他统计
+        if 'enhanced_stats' in result:
+            enhanced = result['enhanced_stats']
+            self.stats['constraints_generated'] += result.get('constraints', 0)
     
     def set_backbone_network(self, backbone_network):
         """设置骨干网络"""
         self.backbone_network = backbone_network
-        self.update_backbone_visualization()
+        self.ecbs_solver.backbone_network = backbone_network
+        
+        if hasattr(self.ecbs_solver, 'node_time_manager'):
+            self.ecbs_solver.node_time_manager.backbone_network = backbone_network
+        if hasattr(self.ecbs_solver, 'path_switcher'):
+            self.ecbs_solver.path_switcher.backbone_network = backbone_network
     
-    def set_traffic_manager(self, traffic_manager):
-        """设置交通管理器"""
-        self.traffic_manager = traffic_manager
+    def set_path_planner(self, path_planner):
+        """设置路径规划器"""
+        self.path_planner = path_planner
+        self.ecbs_solver.path_planner = path_planner
+        
+        if hasattr(self.ecbs_solver, 'path_switcher'):
+            self.ecbs_solver.path_switcher.path_planner = path_planner
     
-    def toggle_safety_rects(self, visible: bool):
-        """切换安全矩形显示"""
-        self.show_safety_rects = visible
-        for vehicle_item in self.vehicle_items.values():
-            vehicle_item.set_safety_rect_visible(visible)
+    def clear_all(self):
+        """清理所有数据"""
+        with self.state_lock:
+            self.active_paths.clear()
+            self.vehicle_predictions.clear()
+            self.path_reservations.clear()
+            self.vehicle_priorities.clear()
+            
+            if hasattr(self, 'parking_vehicles'):
+                self.parking_vehicles.clear()
+                
+            if hasattr(self.ecbs_solver, 'node_time_manager'):
+                self.ecbs_solver.node_time_manager.node_reservations.clear()
+    
+    def shutdown(self):
+        """关闭管理器"""
+        self.clear_all()
+        print("集成BA-ECBS的优化交通管理器已关闭")
 
 
-class ControlPanel(QWidget):
-    """控制面板"""
-    
-    def __init__(self):
-        super().__init__()
-        self.init_ui()
-    
-    def init_ui(self):
-        """初始化界面"""
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-        
-        # 文件操作
-        self._create_file_group(layout)
-        
-        # 系统初始化
-        self._create_init_group(layout)
-        
-        # ECBS协调控制
-        self._create_ecbs_group(layout)
-        
-        # 冲突消解演示
-        self._create_conflict_demo_group(layout)
-        
-        # 任务管理
-        self._create_task_group(layout)
-        
-        # 仿真控制
-        self._create_simulation_group(layout)
-        
-        # 显示选项
-        self._create_display_group(layout)
-        
-        layout.addStretch()
-    
-    def _create_file_group(self, parent_layout):
-        """创建文件操作组"""
-        file_group = QGroupBox("文件操作")
-        file_layout = QHBoxLayout()
-        
-        self.file_label = QLabel("未选择文件")
-        self.file_label.setStyleSheet("""
-            QLabel {
-                background-color: rgb(45, 47, 57);
-                padding: 6px;
-                border: 1px solid rgb(75, 85, 99);
-                border-radius: 3px;
-                color: rgb(156, 163, 175);
-            }
-        """)
-        
-        self.browse_btn = QPushButton("浏览")
-        self.load_btn = QPushButton("加载")
-        
-        file_layout.addWidget(self.file_label, 1)
-        file_layout.addWidget(self.browse_btn)
-        file_layout.addWidget(self.load_btn)
-        
-        file_group.setLayout(file_layout)
-        parent_layout.addWidget(file_group)
-    
-    def _create_init_group(self, parent_layout):
-        """创建系统初始化组"""
-        init_group = QGroupBox("系统初始化")
-        init_layout = QVBoxLayout()
-        
-        # 骨干网络
-        backbone_layout = QHBoxLayout()
-        backbone_layout.addWidget(QLabel("质量阈值:"))
-        
-        self.quality_spin = QDoubleSpinBox()
-        self.quality_spin.setRange(0.3, 1.0)
-        self.quality_spin.setValue(0.6)
-        self.quality_spin.setSingleStep(0.1)
-        
-        self.generate_backbone_btn = QPushButton("生成骨干网络")
-        
-        backbone_layout.addWidget(self.quality_spin)
-        backbone_layout.addWidget(self.generate_backbone_btn)
-        
-        init_layout.addLayout(backbone_layout)
-        init_group.setLayout(init_layout)
-        parent_layout.addWidget(init_group)
-    
-    def _create_ecbs_group(self, parent_layout):
-        """创建ECBS协调控制组"""
-        ecbs_group = QGroupBox("ECBS多车协调")
-        ecbs_layout = QVBoxLayout()
-        
-        # 协调模式
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("模式:"))
-        
-        self.coord_mode_combo = QComboBox()
-        self.coord_mode_combo.addItems(["批量协调", "实时协调", "周期协调"])
-        
-        mode_layout.addWidget(self.coord_mode_combo)
-        ecbs_layout.addLayout(mode_layout)
-        
-        # 协调按钮
-        coord_btn_layout = QHBoxLayout()
-        self.coord_selected_btn = QPushButton("协调选中")
-        self.coord_all_btn = QPushButton("协调所有")
-        
-        coord_btn_layout.addWidget(self.coord_selected_btn)
-        coord_btn_layout.addWidget(self.coord_all_btn)
-        
-        ecbs_layout.addLayout(coord_btn_layout)
-        ecbs_group.setLayout(ecbs_layout)
-        parent_layout.addWidget(ecbs_group)
-    
-    def _create_conflict_demo_group(self, parent_layout):
-        """创建冲突消解演示组"""
-        demo_group = QGroupBox("冲突消解演示")
-        demo_layout = QVBoxLayout()
-        
-        # 演示场景选择
-        scenario_layout = QHBoxLayout()
-        scenario_layout.addWidget(QLabel("场景:"))
-        
-        self.scenario_combo = QComboBox()
-        self.scenario_combo.addItems([
-            "对向冲突",
-            "交叉路口冲突",
-            "骨干路径拥塞",
-            "多车聚集"
-        ])
-        
-        scenario_layout.addWidget(self.scenario_combo)
-        demo_layout.addLayout(scenario_layout)
-        
-        # 演示按钮
-        demo_btn_layout = QHBoxLayout()
-        self.create_scenario_btn = QPushButton("创建场景")
-        self.resolve_conflict_btn = QPushButton("消解冲突")
-        
-        demo_btn_layout.addWidget(self.create_scenario_btn)
-        demo_btn_layout.addWidget(self.resolve_conflict_btn)
-        
-        demo_layout.addLayout(demo_btn_layout)
-        demo_group.setLayout(demo_layout)
-        parent_layout.addWidget(demo_group)
-    
-    def _create_task_group(self, parent_layout):
-        """创建任务管理组"""
-        task_group = QGroupBox("任务管理")
-        task_layout = QVBoxLayout()
-        
-        # 优先级
-        priority_layout = QHBoxLayout()
-        priority_layout.addWidget(QLabel("优先级:"))
-        
-        self.priority_combo = QComboBox()
-        self.priority_combo.addItems(["低", "普通", "高", "紧急"])
-        self.priority_combo.setCurrentIndex(1)
-        
-        priority_layout.addWidget(self.priority_combo)
-        task_layout.addLayout(priority_layout)
-        
-        # 任务分配
-        task_btn_layout = QHBoxLayout()
-        self.assign_single_btn = QPushButton("分配单个")
-        self.assign_batch_btn = QPushButton("批量分配")
-        
-        task_btn_layout.addWidget(self.assign_single_btn)
-        task_btn_layout.addWidget(self.assign_batch_btn)
-        
-        task_layout.addLayout(task_btn_layout)
-        task_group.setLayout(task_layout)
-        parent_layout.addWidget(task_group)
-    
-    def _create_simulation_group(self, parent_layout):
-        """创建仿真控制组"""
-        sim_group = QGroupBox("仿真控制")
-        sim_layout = QVBoxLayout()
-        
-        # 控制按钮
-        control_layout = QHBoxLayout()
-        self.start_btn = QPushButton("开始")
-        self.pause_btn = QPushButton("暂停")
-        self.reset_btn = QPushButton("重置")
-        
-        control_layout.addWidget(self.start_btn)
-        control_layout.addWidget(self.pause_btn)
-        control_layout.addWidget(self.reset_btn)
-        
-        sim_layout.addLayout(control_layout)
-        
-        # 速度控制
-        speed_layout = QHBoxLayout()
-        speed_layout.addWidget(QLabel("速度:"))
-        
-        self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(1, 100)
-        self.speed_slider.setValue(50)
-        
-        self.speed_label = QLabel("1.0x")
-        
-        speed_layout.addWidget(self.speed_slider, 1)
-        speed_layout.addWidget(self.speed_label)
-        
-        sim_layout.addLayout(speed_layout)
-        
-        # 进度条
-        self.progress_bar = QProgressBar()
-        sim_layout.addWidget(self.progress_bar)
-        
-        sim_group.setLayout(sim_layout)
-        parent_layout.addWidget(sim_group)
-    
-    def _create_display_group(self, parent_layout):
-        """创建显示选项组"""
-        display_group = QGroupBox("显示选项")
-        display_layout = QVBoxLayout()
-        
-        self.show_paths_cb = QCheckBox("显示路径")
-        self.show_paths_cb.setChecked(True)
-        
-        self.show_backbone_cb = QCheckBox("显示骨干网络")
-        self.show_backbone_cb.setChecked(True)
-        
-        self.show_interfaces_cb = QCheckBox("显示接口节点")
-        self.show_interfaces_cb.setChecked(True)
-        
-        self.show_conflicts_cb = QCheckBox("显示冲突")
-        self.show_conflicts_cb.setChecked(True)
-        
-        self.show_safety_cb = QCheckBox("显示安全矩形")
-        self.show_safety_cb.setChecked(False)
-        
-        display_layout.addWidget(self.show_paths_cb)
-        display_layout.addWidget(self.show_backbone_cb)
-        display_layout.addWidget(self.show_interfaces_cb)
-        display_layout.addWidget(self.show_conflicts_cb)
-        display_layout.addWidget(self.show_safety_cb)
-        
-        display_group.setLayout(display_layout)
-        parent_layout.addWidget(display_group)
-
-
-class StatusPanel(QWidget):
-    """状态面板"""
-    
-    def __init__(self):
-        super().__init__()
-        self.init_ui()
-    
-    def init_ui(self):
-        """初始化界面"""
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-        
-        # 系统状态
-        self._create_system_status_group(layout)
-        
-        # 冲突管理
-        self._create_conflict_status_group(layout)
-        
-        # ECBS统计
-        self._create_ecbs_stats_group(layout)
-        
-        # 日志输出
-        self._create_log_group(layout)
-        
-        layout.addStretch()
-    
-    def _create_system_status_group(self, parent_layout):
-        """创建系统状态组"""
-        system_group = QGroupBox("系统状态")
-        system_layout = QGridLayout()
-        
-        # 车辆统计
-        self.active_vehicles_label = QLabel("活跃车辆: 0")
-        self.idle_vehicles_label = QLabel("空闲车辆: 0")
-        self.total_vehicles_label = QLabel("总车辆: 0")
-        
-        system_layout.addWidget(self.active_vehicles_label, 0, 0)
-        system_layout.addWidget(self.idle_vehicles_label, 0, 1)
-        system_layout.addWidget(self.total_vehicles_label, 1, 0, 1, 2)
-        
-        # 任务统计
-        self.completed_tasks_label = QLabel("完成任务: 0")
-        self.pending_tasks_label = QLabel("待处理: 0")
-        
-        system_layout.addWidget(self.completed_tasks_label, 2, 0)
-        system_layout.addWidget(self.pending_tasks_label, 2, 1)
-        
-        # 效率指标
-        self.system_efficiency_bar = QProgressBar()
-        self.system_efficiency_bar.setTextVisible(True)
-        self.system_efficiency_bar.setFormat("系统效率: %p%")
-        
-        self.backbone_usage_bar = QProgressBar()
-        self.backbone_usage_bar.setTextVisible(True)
-        self.backbone_usage_bar.setFormat("骨干利用率: %p%")
-        
-        system_layout.addWidget(self.system_efficiency_bar, 3, 0, 1, 2)
-        system_layout.addWidget(self.backbone_usage_bar, 4, 0, 1, 2)
-        
-        system_group.setLayout(system_layout)
-        parent_layout.addWidget(system_group)
-    
-    def _create_conflict_status_group(self, parent_layout):
-        """创建冲突状态组"""
-        conflict_group = QGroupBox("冲突管理")
-        conflict_layout = QVBoxLayout()
-        
-        self.current_conflicts_label = QLabel("当前冲突: 0")
-        self.resolved_conflicts_label = QLabel("已解决: 0")
-        self.prevention_rate_label = QLabel("预防率: 0%")
-        
-        # 冲突类型分布
-        self.conflict_type_label = QLabel("冲突类型:")
-        self.temporal_conflicts_label = QLabel("  时空冲突: 0")
-        self.backbone_conflicts_label = QLabel("  骨干冲突: 0")
-        self.safety_conflicts_label = QLabel("  安全冲突: 0")
-        
-        conflict_layout.addWidget(self.current_conflicts_label)
-        conflict_layout.addWidget(self.resolved_conflicts_label)
-        conflict_layout.addWidget(self.prevention_rate_label)
-        conflict_layout.addWidget(self.conflict_type_label)
-        conflict_layout.addWidget(self.temporal_conflicts_label)
-        conflict_layout.addWidget(self.backbone_conflicts_label)
-        conflict_layout.addWidget(self.safety_conflicts_label)
-        
-        conflict_group.setLayout(conflict_layout)
-        parent_layout.addWidget(conflict_group)
-    
-    def _create_ecbs_stats_group(self, parent_layout):
-        """创建ECBS统计组"""
-        ecbs_group = QGroupBox("ECBS协调统计")
-        ecbs_layout = QVBoxLayout()
-        
-        self.ecbs_coordinations_label = QLabel("协调次数: 0")
-        self.ecbs_success_rate_label = QLabel("成功率: 0%")
-        self.ecbs_avg_time_label = QLabel("平均耗时: 0.0s")
-        self.ecbs_expansions_label = QLabel("平均扩展: 0")
-        
-        ecbs_layout.addWidget(self.ecbs_coordinations_label)
-        ecbs_layout.addWidget(self.ecbs_success_rate_label)
-        ecbs_layout.addWidget(self.ecbs_avg_time_label)
-        ecbs_layout.addWidget(self.ecbs_expansions_label)
-        
-        ecbs_group.setLayout(ecbs_layout)
-        parent_layout.addWidget(ecbs_group)
-    
-    def _create_log_group(self, parent_layout):
-        """创建日志组"""
-        log_group = QGroupBox("系统日志")
-        log_layout = QVBoxLayout()
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(200)
-        
-        log_layout.addWidget(self.log_text)
-        
-        log_group.setLayout(log_layout)
-        parent_layout.addWidget(log_group)
-    
-    def add_log(self, message, level='info'):
-        """添加日志"""
-        timestamp = time.strftime("%H:%M:%S")
-        
-        color_map = {
-            'error': 'red',
-            'warning': 'orange', 
-            'success': 'green',
-            'info': 'white'
-        }
-        
-        color = color_map.get(level, 'white')
-        
-        html = f'<span style="color: gray">[{timestamp}]</span> <span style="color: {color}">{message}</span>'
-        self.log_text.append(html)
-        
-        # 保持最新消息可见
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
-
-
-class ImprovedMineGUI(QMainWindow):
-    """改进版露天矿调度系统GUI"""
-    
-    def __init__(self):
-        super().__init__()
-        
-        # 系统组件
-        self.env = None
-        self.backbone_network = None
-        self.path_planner = None
-        self.vehicle_scheduler = None
-        self.traffic_manager = None
-        
-        # 状态
-        self.is_simulating = False
-        self.simulation_time = 0
-        self.simulation_speed = 1.0
-        self.map_file_path = None
-        
-        # 初始化界面
-        self.init_ui()
-        
-        # 定时器
-        self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(self.update_display)
-        self.update_timer.start(100)  # 100ms更新一次
-        
-        self.sim_timer = QTimer(self)
-        self.sim_timer.timeout.connect(self.simulation_step)
-        
-        self.stats_timer = QTimer(self)
-        self.stats_timer.timeout.connect(self.update_statistics)
-        self.stats_timer.start(1000)  # 1秒更新一次
-    
-    def init_ui(self):
-        """初始化界面"""
-        self.setWindowTitle("露天矿多车协同调度系统 - 改进版")
-        self.setGeometry(100, 100, 1400, 900)
-        
-        # 设置样式
-        self.setStyleSheet(f"""
-            QMainWindow {{
-                background-color: {COLORS['bg'].name()};
-                color: {COLORS['text'].name()};
-            }}
-            QGroupBox {{
-                font-weight: bold;
-                border: 1px solid {COLORS['border'].name()};
-                border-radius: 4px;
-                margin-top: 8px;
-                padding-top: 6px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-            }}
-            QPushButton {{
-                background-color: {COLORS['primary'].name()};
-                color: white;
-                border: none;
-                padding: 5px 10px;
-                border-radius: 3px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: {COLORS['primary'].darker(110).name()};
-            }}
-            QPushButton:pressed {{
-                background-color: {COLORS['primary'].darker(120).name()};
-            }}
-            QComboBox, QSpinBox, QDoubleSpinBox {{
-                background-color: {COLORS['surface'].name()};
-                border: 1px solid {COLORS['border'].name()};
-                border-radius: 3px;
-                padding: 3px;
-                color: {COLORS['text'].name()};
-            }}
-            QProgressBar {{
-                border: 1px solid {COLORS['border'].name()};
-                border-radius: 3px;
-                text-align: center;
-                background-color: {COLORS['surface'].name()};
-            }}
-            QProgressBar::chunk {{
-                background-color: {COLORS['success'].name()};
-                border-radius: 2px;
-            }}
-        """)
-        
-        # 中央部件
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
-        # 主布局
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(8)
-        
-        # 左侧控制面板
-        self.control_panel = ControlPanel()
-        self.control_panel.setMaximumWidth(280)
-        main_layout.addWidget(self.control_panel)
-        
-        # 中央视图
-        self.scene = ImprovedMineScene()
-        self.view = QGraphicsView(self.scene)
-        self.view.setRenderHint(QPainter.Antialiasing)
-        self.view.setDragMode(QGraphicsView.RubberBandDrag)
-        main_layout.addWidget(self.view, 1)
-        
-        # 右侧状态面板
-        self.status_panel = StatusPanel()
-        self.status_panel.setMaximumWidth(320)
-        main_layout.addWidget(self.status_panel)
-        
-        # 连接信号
-        self.connect_signals()
-        
-        # 初始日志
-        self.status_panel.add_log("系统已启动", 'success')
-        self.status_panel.add_log("改进版：修复递归问题，完善骨干路径可视化", 'info')
-    
-    def connect_signals(self):
-        """连接信号"""
-        # 文件操作
-        self.control_panel.browse_btn.clicked.connect(self.browse_file)
-        self.control_panel.load_btn.clicked.connect(self.load_environment)
-        
-        # 系统初始化
-        self.control_panel.generate_backbone_btn.clicked.connect(self.generate_backbone_network)
-        
-        # ECBS协调
-        self.control_panel.coord_selected_btn.clicked.connect(self.coordinate_selected_vehicles)
-        self.control_panel.coord_all_btn.clicked.connect(self.coordinate_all_vehicles)
-        
-        # 冲突消解演示
-        self.control_panel.create_scenario_btn.clicked.connect(self.create_conflict_scenario)
-        self.control_panel.resolve_conflict_btn.clicked.connect(self.resolve_conflicts_demo)
-        
-        # 任务管理
-        self.control_panel.assign_single_btn.clicked.connect(self.assign_single_task)
-        self.control_panel.assign_batch_btn.clicked.connect(self.assign_batch_tasks)
-        
-        # 仿真控制
-        self.control_panel.start_btn.clicked.connect(self.start_simulation)
-        self.control_panel.pause_btn.clicked.connect(self.pause_simulation)
-        self.control_panel.reset_btn.clicked.connect(self.reset_simulation)
-        self.control_panel.speed_slider.valueChanged.connect(self.update_speed)
-        
-        # 显示选项
-        self.control_panel.show_paths_cb.toggled.connect(
-            lambda checked: setattr(self.scene, 'show_paths', checked)
-        )
-        self.control_panel.show_backbone_cb.toggled.connect(self.toggle_backbone_display)
-        self.control_panel.show_interfaces_cb.toggled.connect(
-            lambda checked: setattr(self.scene, 'show_interfaces', checked)
-        )
-        self.control_panel.show_conflicts_cb.toggled.connect(
-            lambda checked: setattr(self.scene, 'show_conflicts', checked)
-        )
-        self.control_panel.show_safety_cb.toggled.connect(self.scene.toggle_safety_rects)
-    
-    def browse_file(self):
-        """浏览文件"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "打开地图文件", "", "JSON文件 (*.json);;所有文件 (*)"
-        )
-        
-        if file_path:
-            self.map_file_path = file_path
-            self.control_panel.file_label.setText(os.path.basename(file_path))
-            self.status_panel.add_log(f"选择文件: {os.path.basename(file_path)}")
-    
-    def load_environment(self):
-        """加载环境"""
-        if not self.map_file_path:
-            QMessageBox.warning(self, "警告", "请先选择地图文件")
-            return
-        
-        try:
-            self.status_panel.add_log("正在加载环境...")
-            
-            # 创建环境
-            self.env = OptimizedOpenPitMineEnv()
-            if not self.env.load_from_file(self.map_file_path):
-                raise Exception("环境加载失败")
-            
-            # 设置到场景
-            self.scene.set_environment(self.env)
-            
-            # 创建系统组件
-            self.create_system_components()
-            
-            self.status_panel.add_log("环境加载成功", 'success')
-            self.fit_view()
-            
-        except Exception as e:
-            self.status_panel.add_log(f"加载失败: {str(e)}", 'error')
-            QMessageBox.critical(self, "错误", f"加载环境失败:\n{str(e)}")
-    
-    def create_system_components(self):
-        """创建系统组件"""
-        try:
-            # 创建路径规划器
-            self.path_planner = EnhancedPathPlannerWithConfig(self.env)
-            
-            # 创建骨干网络
-            self.backbone_network = OptimizedBackboneNetwork(self.env)
-            self.backbone_network.set_path_planner(self.path_planner)
-            
-            # 创建交通管理器
-            self.traffic_manager = OptimizedTrafficManagerWithECBS(
-                self.env, self.backbone_network, self.path_planner
-            )
-            
-            # 创建车辆调度器
-            self.vehicle_scheduler = EnhancedVehicleScheduler(
-                self.env, self.path_planner, self.backbone_network, self.traffic_manager
-            )
-            
-            # 设置组件引用
-            self.scene.set_backbone_network(self.backbone_network)
-            self.scene.set_traffic_manager(self.traffic_manager)
-            
-            # 初始化车辆
-            self.vehicle_scheduler.initialize_vehicles()
-            
-            # 创建默认任务模板
-            if self.env.loading_points and self.env.unloading_points:
-                from vehicle_scheduler import TaskPriority
-                self.vehicle_scheduler.create_enhanced_mission_template(
-                    "default", priority=TaskPriority.NORMAL
-                )
-            
-            self.status_panel.add_log("系统组件创建成功", 'success')
-            
-        except Exception as e:
-            raise Exception(f"系统组件初始化失败: {str(e)}")
-    
-    def generate_backbone_network(self):
-        """生成骨干网络"""
-        if not self.env or not self.backbone_network:
-            QMessageBox.warning(self, "警告", "请先加载环境")
-            return
-        
-        try:
-            self.status_panel.add_log("正在生成骨干网络...")
-            
-            quality_threshold = self.control_panel.quality_spin.value()
-            
-            success = self.backbone_network.generate_backbone_network(
-                quality_threshold=quality_threshold
-            )
-            
-            if success:
-                # 更新可视化
-                self.scene.update_backbone_visualization()
-                
-                # 获取网络状态
-                network_status = self.backbone_network.get_network_status()
-                path_count = network_status['bidirectional_paths']
-                interface_count = network_status['total_interfaces']
-                
-                self.status_panel.add_log(
-                    f"骨干网络生成成功: {path_count} 条路径, {interface_count} 个接口", 
-                    'success'
-                )
-                
-                QMessageBox.information(self, "成功", 
-                    f"骨干网络生成成功\n双向路径: {path_count} 条\n接口节点: {interface_count} 个")
-            else:
-                self.status_panel.add_log("骨干网络生成失败", 'error')
-                QMessageBox.critical(self, "错误", "骨干网络生成失败")
-                
-        except Exception as e:
-            self.status_panel.add_log(f"生成异常: {str(e)}", 'error')
-            QMessageBox.critical(self, "错误", f"生成骨干网络失败:\n{str(e)}")
-    
-    def create_conflict_scenario(self):
-        """创建冲突场景"""
-        if not self.env or not self.vehicle_scheduler:
-            QMessageBox.warning(self, "警告", "请先加载环境")
-            return
-        
-        scenario_index = self.control_panel.scenario_combo.currentIndex()
-        scenario_names = ["对向冲突", "交叉路口冲突", "骨干路径拥塞", "多车聚集"]
-        scenario_name = scenario_names[scenario_index]
-        
-        self.status_panel.add_log(f"创建冲突场景: {scenario_name}")
-        
-        try:
-            if scenario_index == 0:  # 对向冲突
-                self._create_head_on_conflict()
-            elif scenario_index == 1:  # 交叉路口冲突
-                self._create_intersection_conflict()
-            elif scenario_index == 2:  # 骨干路径拥塞
-                self._create_backbone_congestion()
-            elif scenario_index == 3:  # 多车聚集
-                self._create_multi_vehicle_gathering()
-            
-            self.status_panel.add_log(f"冲突场景创建成功", 'success')
-            
-        except Exception as e:
-            self.status_panel.add_log(f"创建场景失败: {str(e)}", 'error')
-    
-    def _create_head_on_conflict(self):
-        """创建对向冲突场景"""
-        # 找两个车辆，让它们相向而行
-        vehicles = list(self.env.vehicles.keys())
-        if len(vehicles) < 2:
-            raise Exception("至少需要2个车辆")
-        
-        v1_id, v2_id = vehicles[0], vehicles[1]
-        
-        # 设置相对的位置和目标
-        center_x, center_y = self.env.width / 2, self.env.height / 2
-        
-        # 更新车辆位置
-        self.env.update_vehicle_position(v1_id, (center_x - 50, center_y, 0))
-        self.env.update_vehicle_position(v2_id, (center_x + 50, center_y, math.pi))
-        
-        # 分配相向的任务
-        from vehicle_scheduler import TaskPriority
-        self.vehicle_scheduler.assign_mission_intelligently(
-            v1_id, "default", TaskPriority.HIGH
-        )
-        self.vehicle_scheduler.assign_mission_intelligently(
-            v2_id, "default", TaskPriority.HIGH
-        )
-    
-    def _create_intersection_conflict(self):
-        """创建交叉路口冲突"""
-        # 实现类似的逻辑
-        pass
-    
-    def _create_backbone_congestion(self):
-        """创建骨干路径拥塞"""
-        # 让多个车辆使用同一条骨干路径
-        pass
-    
-    def _create_multi_vehicle_gathering(self):
-        """创建多车聚集场景"""
-        # 让多个车辆聚集到同一个点
-        pass
-    
-    def resolve_conflicts_demo(self):
-        """演示冲突消解"""
-        if not self.traffic_manager:
-            QMessageBox.warning(self, "警告", "交通管理器未初始化")
-            return
-        
-        self.status_panel.add_log("开始冲突消解演示...")
-        
-        try:
-            # 检测当前冲突
-            conflicts = self.traffic_manager.detect_all_conflicts()
-            
-            if not conflicts:
-                self.status_panel.add_log("当前没有检测到冲突", 'info')
-                return
-            
-            self.status_panel.add_log(f"检测到 {len(conflicts)} 个冲突", 'warning')
-            
-            # 解决冲突
-            if hasattr(self.traffic_manager, 'resolve_conflicts'):
-                resolved_paths = self.traffic_manager.resolve_conflicts(conflicts)
-                
-                # 应用解决方案
-                for vehicle_id, new_path in resolved_paths.items():
-                    if vehicle_id in self.env.vehicles:
-                        vehicle = self.env.vehicles[vehicle_id]
-                        if hasattr(vehicle, 'path'):
-                            vehicle.path = new_path
-                        else:
-                            vehicle['path'] = new_path
-                
-                self.status_panel.add_log("冲突消解完成", 'success')
-                
-                # 重新检测冲突
-                remaining_conflicts = self.traffic_manager.detect_all_conflicts()
-                self.status_panel.add_log(
-                    f"剩余冲突: {len(remaining_conflicts)}", 
-                    'success' if len(remaining_conflicts) == 0 else 'warning'
-                )
-            
-        except Exception as e:
-            self.status_panel.add_log(f"冲突消解失败: {str(e)}", 'error')
-    
-    def coordinate_selected_vehicles(self):
-        """协调选中车辆"""
-        # 简化实现：协调前3个空闲车辆
-        vehicle_ids = []
-        
-        if self.vehicle_scheduler:
-            for vid, state in self.vehicle_scheduler.vehicle_states.items():
-                if str(state.status) == 'VehicleStatus.IDLE':
-                    vehicle_ids.append(vid)
-                    if len(vehicle_ids) >= 3:
-                        break
-        
-        if len(vehicle_ids) < 2:
-            QMessageBox.information(self, "提示", "需要至少2个空闲车辆才能协调")
-            return
-        
-        self._coordinate_vehicles(vehicle_ids)
-    
-    def coordinate_all_vehicles(self):
-        """协调所有车辆"""
-        if not self.vehicle_scheduler:
-            QMessageBox.warning(self, "警告", "请先加载环境")
-            return
-        
-        vehicle_ids = list(self.env.vehicles.keys()) if self.env else []
-        
-        if len(vehicle_ids) < 2:
-            QMessageBox.information(self, "提示", "需要至少2个车辆才能协调")
-            return
-        
-        self._coordinate_vehicles(vehicle_ids)
-    
-    def _coordinate_vehicles(self, vehicle_ids):
-        """执行车辆协调"""
-        try:
-            self.status_panel.add_log(f"开始ECBS协调 {len(vehicle_ids)} 个车辆...")
-            
-            # 获取协调模式
-            mode_map = {
-                0: "BATCH_COORDINATION",
-                1: "REAL_TIME_COORDINATION",
-                2: "PERIODIC_COORDINATION"
-            }
-            mode_index = self.control_panel.coord_mode_combo.currentIndex()
-            
-            from vehicle_scheduler import CoordinationMode, TaskPriority
-            coordination_mode = getattr(CoordinationMode, mode_map[mode_index])
-            
-            # 获取优先级
-            priority_map = {0: "LOW", 1: "NORMAL", 2: "HIGH", 3: "URGENT"}
-            priority_index = self.control_panel.priority_combo.currentIndex()
-            priority = getattr(TaskPriority, priority_map[priority_index])
-            
-            success = self.vehicle_scheduler.coordinate_multiple_vehicles(
-                vehicle_ids, 
-                coordination_mode=coordination_mode,
-                priority=priority
-            )
-            
-            if success:
-                self.status_panel.add_log(f"ECBS协调成功", 'success')
-                QMessageBox.information(self, "成功", f"成功协调 {len(vehicle_ids)} 个车辆")
-            else:
-                self.status_panel.add_log("ECBS协调失败", 'error')
-                QMessageBox.warning(self, "失败", "ECBS协调失败")
-                
-        except Exception as e:
-            self.status_panel.add_log(f"协调异常: {str(e)}", 'error')
-            QMessageBox.critical(self, "错误", f"ECBS协调失败:\n{str(e)}")
-    
-    def assign_single_task(self):
-        """分配单个任务"""
-        if not self.vehicle_scheduler:
-            return
-        
-        try:
-            # 获取优先级
-            priority_map = {0: "LOW", 1: "NORMAL", 2: "HIGH", 3: "URGENT"}
-            priority_index = self.control_panel.priority_combo.currentIndex()
-            
-            from vehicle_scheduler import TaskPriority
-            priority = getattr(TaskPriority, priority_map[priority_index])
-            
-            success = self.vehicle_scheduler.assign_mission_intelligently(
-                vehicle_id=None, priority=priority
-            )
-            
-            if success:
-                self.status_panel.add_log("任务分配成功", 'success')
-            else:
-                self.status_panel.add_log("没有可用车辆", 'warning')
-                
-        except Exception as e:
-            self.status_panel.add_log(f"任务分配失败: {str(e)}", 'error')
-    
-    def assign_batch_tasks(self):
-        """批量分配任务"""
-        if not self.vehicle_scheduler or not self.env:
-            return
-        
-        try:
-            # 获取优先级
-            priority_map = {0: "LOW", 1: "NORMAL", 2: "HIGH", 3: "URGENT"}
-            priority_index = self.control_panel.priority_combo.currentIndex()
-            
-            from vehicle_scheduler import TaskPriority
-            priority = getattr(TaskPriority, priority_map[priority_index])
-            
-            assigned_count = 0
-            
-            for vehicle_id in self.env.vehicles.keys():
-                if self.vehicle_scheduler.assign_mission_intelligently(
-                    vehicle_id=vehicle_id, priority=priority
-                ):
-                    assigned_count += 1
-            
-            self.status_panel.add_log(f"批量分配成功: {assigned_count} 个任务", 'success')
-            
-        except Exception as e:
-            self.status_panel.add_log(f"批量分配失败: {str(e)}", 'error')
-    
-    def start_simulation(self):
-        """开始仿真"""
-        if not self.env:
-            return
-        
-        self.is_simulating = True
-        self.control_panel.start_btn.setEnabled(False)
-        self.control_panel.pause_btn.setEnabled(True)
-        
-        # 启动定时器
-        interval = max(50, int(100 / self.simulation_speed))
-        self.sim_timer.start(interval)
-        
-        self.status_panel.add_log("仿真已开始", 'success')
-    
-    def pause_simulation(self):
-        """暂停仿真"""
-        self.is_simulating = False
-        self.control_panel.start_btn.setEnabled(True)
-        self.control_panel.pause_btn.setEnabled(False)
-        
-        self.sim_timer.stop()
-        
-        self.status_panel.add_log("仿真已暂停", 'warning')
-    
-    def reset_simulation(self):
-        """重置仿真"""
-        if self.is_simulating:
-            self.pause_simulation()
-        
-        if self.env:
-            self.env.reset()
-        
-        if self.vehicle_scheduler:
-            self.vehicle_scheduler.initialize_vehicles()
-        
-        # 清理交通管理器
-        if self.traffic_manager:
-            self.traffic_manager.clear_all()
-        
-        self.scene.set_environment(self.env)
-        
-        self.simulation_time = 0
-        self.control_panel.progress_bar.setValue(0)
-        
-        self.status_panel.add_log("仿真已重置", 'success')
-    
-    def update_speed(self, value):
-        """更新速度"""
-        self.simulation_speed = value / 50.0
-        self.control_panel.speed_label.setText(f"{self.simulation_speed:.1f}x")
-        
-        if self.is_simulating:
-            interval = max(50, int(100 / self.simulation_speed))
-            self.sim_timer.start(interval)
-    
-    def simulation_step(self):
-        """仿真步骤 - 修复版"""
-        if not self.is_simulating or not self.env:
-            return
-        
-        time_delta = 0.5 * self.simulation_speed
-        self.simulation_time += time_delta
-        
-        # 更新环境时间
-        self.env.current_time = self.simulation_time
-        
-        # 更新调度器
-        if self.vehicle_scheduler:
-            try:
-                # 调用调度器更新
-                self.vehicle_scheduler.update(time_delta)
-                
-                # ★ 关键修复：同步车辆状态到环境
-                if hasattr(self.vehicle_scheduler, 'vehicle_states'):
-                    for vehicle_id, vehicle_state in self.vehicle_scheduler.vehicle_states.items():
-                        if vehicle_id in self.env.vehicles:
-                            # 获取环境中的车辆数据
-                            vehicle_data = self.env.vehicles[vehicle_id]
-                            
-                            # 1. 更新位置
-                            new_position = vehicle_state.current_position
-                            
-                            # 检查环境是否有update_vehicle_position方法
-                            if hasattr(self.env, 'update_vehicle_position'):
-                                self.env.update_vehicle_position(vehicle_id, new_position)
-                            else:
-                                # 直接更新
-                                if isinstance(vehicle_data, dict):
-                                    vehicle_data['position'] = new_position
-                                else:
-                                    vehicle_data.position = new_position
-                            
-                            # 2. 更新状态
-                            status_str = str(vehicle_state.status).split('.')[-1].lower()
-                            if isinstance(vehicle_data, dict):
-                                vehicle_data['status'] = status_str
-                            else:
-                                vehicle_data.status = status_str
-                            
-                            # 3. 更新路径（如果有）
-                            if hasattr(vehicle_state, 'current_path') and vehicle_state.current_path:
-                                if isinstance(vehicle_data, dict):
-                                    vehicle_data['path'] = vehicle_state.current_path
-                                else:
-                                    vehicle_data.path = vehicle_state.current_path
-                            
-                            # 4. 更新其他属性
-                            # 当前载重
-                            if hasattr(vehicle_state, 'current_load'):
-                                if isinstance(vehicle_data, dict):
-                                    vehicle_data['current_load'] = vehicle_state.current_load
-                                else:
-                                    vehicle_data.current_load = vehicle_state.current_load
-                            
-                            # 效率分数
-                            if hasattr(vehicle_state, 'calculate_efficiency_score'):
-                                efficiency = vehicle_state.calculate_efficiency_score()
-                                if isinstance(vehicle_data, dict):
-                                    vehicle_data['efficiency_score'] = efficiency
-                                else:
-                                    vehicle_data.efficiency_score = efficiency
-                            
-                            # 骨干使用率
-                            if hasattr(vehicle_state, 'backbone_usage_ratio'):
-                                if isinstance(vehicle_data, dict):
-                                    vehicle_data['backbone_usage_ratio'] = vehicle_state.backbone_usage_ratio
-                                else:
-                                    vehicle_data.backbone_usage_ratio = vehicle_state.backbone_usage_ratio
-                            
-                            # ECBS信息
-                            if hasattr(vehicle_state, 'is_coordinated') and vehicle_state.is_coordinated:
-                                ecbs_info = f"协调组: {getattr(vehicle_state, 'coordination_group', 'N/A')}"
-                                if isinstance(vehicle_data, dict):
-                                    vehicle_data['ecbs_info'] = ecbs_info
-                                    vehicle_data['is_coordinated'] = True
-                                else:
-                                    vehicle_data.ecbs_info = ecbs_info
-                                    vehicle_data.is_coordinated = True
-                                    
-            except Exception as e:
-                print(f"调度器更新错误: {e}")
-                self.status_panel.add_log(f"调度器更新错误: {e}", 'error')
-        
-        # 更新交通管理器
-        if self.traffic_manager:
-            try:
-                self.traffic_manager.update(time_delta)
-            except Exception as e:
-                print(f"交通管理器更新错误: {e}")
-        
-        # 更新进度条
-        max_time = 1800  # 30分钟
-        progress = min(100, int(self.simulation_time * 100 / max_time))
-        self.control_panel.progress_bar.setValue(progress)
-        
-        # 检查是否完成
-        if progress >= 100:
-            self.pause_simulation()
-            self.status_panel.add_log("仿真完成！", 'success')
-            QMessageBox.information(self, "完成", "仿真已完成！")
-    
-    def toggle_backbone_display(self, show):
-        """切换骨干网络显示"""
-        self.scene.show_backbone = show
-        self.scene.update_backbone_visualization()
-        
-        # 同时更新接口节点显示
-        if show and self.control_panel.show_interfaces_cb.isChecked():
-            self.scene.show_interfaces = True
-    
-    def update_display(self):
-        """更新显示（防止递归）"""
-        if not self.env:
-            return
-        
-        # 更新车辆
-        self.scene.update_vehicles()
-        
-        # 更新冲突
-        if self.scene.show_conflicts:
-            self.scene.update_conflicts()
-    
-    def update_statistics(self):
-        """更新统计"""
-        if not self.vehicle_scheduler:
-            return
-        
-        try:
-            stats = self.vehicle_scheduler.get_comprehensive_stats()
-            
-            # 更新车辆统计
-            real_time = stats.get('real_time', {})
-            self.status_panel.active_vehicles_label.setText(
-                f"活跃车辆: {real_time.get('active_vehicles', 0)}"
-            )
-            self.status_panel.idle_vehicles_label.setText(
-                f"空闲车辆: {real_time.get('idle_vehicles', 0)}"
-            )
-            self.status_panel.total_vehicles_label.setText(
-                f"总车辆: {real_time.get('total_vehicles', 0)}"
-            )
-            
-            # 更新任务统计
-            self.status_panel.completed_tasks_label.setText(
-                f"完成任务: {stats.get('completed_tasks', 0)}"
-            )
-            
-            # 更新效率
-            efficiency_metrics = stats.get('efficiency_metrics', {})
-            system_efficiency = efficiency_metrics.get('current_system_efficiency', 0) * 100
-            self.status_panel.system_efficiency_bar.setValue(int(system_efficiency))
-            
-            # 更新骨干利用率
-            if self.backbone_network:
-                network_status = self.backbone_network.get_network_status()
-                backbone_usage = network_status.get('load_balancing', {}).get('average_path_utilization', 0) * 100
-                self.status_panel.backbone_usage_bar.setValue(int(backbone_usage))
-            
-            # 更新冲突统计
-            if self.traffic_manager:
-                conflicts = self.traffic_manager.detect_all_conflicts()
-                self.status_panel.current_conflicts_label.setText(
-                    f"当前冲突: {len(conflicts)}"
-                )
-                
-                traffic_stats = self.traffic_manager.get_statistics()
-                self.status_panel.resolved_conflicts_label.setText(
-                    f"已解决: {traffic_stats.get('resolved_conflicts', 0)}"
-                )
-                
-                # 更新ECBS统计
-                self.status_panel.ecbs_coordinations_label.setText(
-                    f"协调次数: {traffic_stats.get('ecbs_coordinations', 0)}"
-                )
-                
-                # ECBS成功率
-                ecbs_success_rate = traffic_stats.get('ecbs_success_rate', 0) * 100
-                self.status_panel.ecbs_success_rate_label.setText(
-                    f"成功率: {ecbs_success_rate:.1f}%"
-                )
-                
-                # 平均求解时间
-                avg_solve_time = traffic_stats.get('average_solve_time', 0)
-                self.status_panel.ecbs_avg_time_label.setText(
-                    f"平均耗时: {avg_solve_time:.2f}s"
-                )
-                
-        except Exception as e:
-            print(f"更新统计失败: {e}")
-    
-    def fit_view(self):
-        """适应视图"""
-        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
-    
-    def closeEvent(self, event):
-        """关闭事件"""
-        if self.is_simulating:
-            reply = QMessageBox.question(
-                self, '确认退出',
-                '仿真正在运行，确定要退出吗？',
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            
-            if reply == QMessageBox.No:
-                event.ignore()
-                return
-        
-        # 停止定时器
-        self.update_timer.stop()
-        self.sim_timer.stop()
-        self.stats_timer.stop()
-        
-        # 清理冲突标记
-        for marker in self.scene.conflict_markers.values():
-            marker.cleanup()
-        
-        # 关闭组件
-        try:
-            if self.vehicle_scheduler:
-                self.vehicle_scheduler.shutdown()
-            if self.traffic_manager:
-                self.traffic_manager.shutdown()
-            if self.path_planner:
-                self.path_planner.shutdown()
-        except:
-            pass
-        
-        event.accept()
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setApplicationName("露天矿多车协同调度系统")
-    
-    # 设置全局字体
-    app.setStyleSheet("""
-        QApplication {
-            font-family: "Microsoft YaHei", "SimHei", Arial, sans-serif;
-            font-size: 9pt;
-        }
-    """)
-    
-    try:
-        window = ImprovedMineGUI()
-        window.show()
-        
-        print("🚀 改进版露天矿调度系统启动成功")
-        print("✨ 主要改进:")
-        print("   - 修复递归深度问题")
-        print("   - 完善骨干路径可视化（显示接口节点）")  
-        print("   - 增强冲突显示效果")
-        print("   - 添加冲突消解演示功能")
-        
-        sys.exit(app.exec_())
-        
-    except Exception as e:
-        print(f"❌ 启动失败: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+# 向后兼容性
+OptimizedTrafficManager = OptimizedTrafficManagerWithECBS
